@@ -1,0 +1,33 @@
+# Derived index — always rebuildable, never committed
+cache/
+*.db
+*.db-wal
+*.db-shm
+
+# Machine-local, non-rebuildable lossy usage telemetry — never committed
+local/
+
+# Local environment / secrets — never committed
+.env
+.env.*
+
+# remember tool's cross-process lockfile (BRAIN_DIR root, transient)
+.remember.lock
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Local model caches (fastembed / huggingface), if ever placed in-repo
+fastembed_cache/
+.fastembed_cache/
+huggingface/
+models--*/
+
+.DS_Store
