@@ -1,0 +1,10 @@
+[Unit]
+Description=brain: daily state-note freshness audit
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target

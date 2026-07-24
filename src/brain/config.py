@@ -2,7 +2,9 @@
 
 Env overrides:
   BRAIN_DIR              — repo root (default: this repo, resolved from the package location)
-  BRAIN_CLAUDE_PROJECTS  — Claude Code projects dir (default: ~/.claude/projects)
+  BRAIN_CLAUDE_PROJECTS  — Claude Code projects dir(s), colon-separated
+                           (default: ~/.claude/projects and ~/.claude-work/projects,
+                           each included only if it exists)
   BRAIN_RRF_K            — RRF damping constant (default: 60)
   BRAIN_KIND_WEIGHT_{MEMORY,SUMMARY,EPISODE}  — per-kind rank multipliers
   BRAIN_HALF_LIFE_{MEMORY,SUMMARY,EPISODE}    — per-kind recency half-life (days)
@@ -33,6 +35,25 @@ CACHE_DIR = BRAIN_DIR / "cache"
 DB_PATH = CACHE_DIR / "brain.db"
 MEMORIES_DIR = BRAIN_DIR / "memories"
 SUMMARIES_DIR = BRAIN_DIR / "summaries"  # reflect-written session digests (git-tracked)
+# Per-episode files emitted by Mac-side ingest so a transcript-less VM can index
+# episodes over `git pull` (episodes-in-git transport; see specs/episodes-in-git.md).
+# Git-tracked (NOT gitignored, unlike cache/); sharded episodes/YYYY/MM/<id>.md.
+EPISODES_DIR = BRAIN_DIR / "episodes"
+
+# Episode source selection (episodes-in-git transport). One of:
+#   auto        — infer from what's present: transcripts -> transcript mode,
+#                 else episode files -> episode-file mode (the default).
+#   episodes    — force episode-file mode: index episodes/**/*.md ONLY;
+#                 transcripts are never scanned, indexed, emitted, or committed.
+#   transcripts — force transcript mode: parse + emit transcripts as usual.
+# The always-on VM MUST set BRAIN_INGEST_SOURCE=episodes: it accrues its own
+# `claude -p` reflect transcripts under ~/.claude/projects, and auto would then
+# flip it into transcript mode — indexing those, ignoring the pulled episode
+# files, and (worst) emitting+pushing its own episodes, violating the
+# Mac-is-sole-writer rule. Whitespace/empty -> auto; any other value is rejected
+# LOUDLY at ingest start (never a silent fallback — that would reintroduce the
+# bug invisibly). Validated in ingest.run_ingest, not here.
+INGEST_SOURCE = (os.environ.get("BRAIN_INGEST_SOURCE") or "").strip().lower() or "auto"
 
 # Privacy denylist for session digests: comma-separated cwd/project substrings.
 # Reflect drops any digest candidate whose cwd/project contains one of these,
@@ -42,9 +63,59 @@ BRAIN_DIGEST_EXCLUDE = [
     s.strip() for s in os.environ.get("BRAIN_DIGEST_EXCLUDE", "").split(",") if s.strip()
 ]
 
-CLAUDE_PROJECTS = Path(
-    os.environ.get("BRAIN_CLAUDE_PROJECTS") or "~/.claude/projects"
-).expanduser()
+# Privacy denylist for episode-file emission (episodes-in-git transport; see
+# specs/episodes-in-git.md): comma-separated cwd/project substrings. When the
+# env var is UNSET it inherits BRAIN_DIGEST_EXCLUDE, so a project already kept
+# out of git-tracked summaries/ is also never written to git-tracked episodes/.
+# Set it explicitly (even to "") to override that inheritance. Episodes whose
+# cwd matches are still indexed in the LOCAL cache DB exactly as today — they
+# just never get an episodes/ file. Matched like BRAIN_DIGEST_EXCLUDE: substring
+# of the episode `cwd` (the project basename is a substring of the cwd).
+BRAIN_EPISODE_EXCLUDE = (
+    [s.strip() for s in os.environ["BRAIN_EPISODE_EXCLUDE"].split(",") if s.strip()]
+    if "BRAIN_EPISODE_EXCLUDE" in os.environ
+    else list(BRAIN_DIGEST_EXCLUDE)
+)
+
+# Claude Code transcript scan roots. The CLAUDE_CONFIG_DIR migration split
+# sessions across two trees (~/.claude/projects and ~/.claude-work/projects);
+# both must be scanned. BRAIN_CLAUDE_PROJECTS overrides with a colon-separated
+# list of dirs. Transcript "absence" (for prune) means absent from the UNION of
+# all scanned dirs — see ingest.find_transcripts.
+def _parse_project_dirs() -> list[Path]:
+    raw = os.environ.get("BRAIN_CLAUDE_PROJECTS")
+    if raw:
+        # Explicit override: honor exactly what was configured (existence is
+        # checked at scan time, not here — the prune guard names these dirs so
+        # a typo'd path stays visible in the error rather than silently pruned).
+        out: list[Path] = []
+        seen: set[str] = set()
+        for part in raw.split(":"):
+            part = part.strip()
+            if not part:
+                continue
+            d = Path(part).expanduser()
+            if str(d) not in seen:
+                seen.add(str(d))
+                out.append(d)
+        return out
+    # Default: both known roots, each included only if it exists — so a machine
+    # that never had the legacy ~/.claude/projects doesn't carry a phantom dir.
+    candidates = [
+        Path("~/.claude/projects").expanduser(),
+        Path("~/.claude-work/projects").expanduser(),
+    ]
+    return [d for d in candidates if d.is_dir()]
+
+
+CLAUDE_PROJECTS_DIRS = _parse_project_dirs()
+# Back-compat single-dir alias (first configured root, else the legacy default);
+# retained for callers that key off a single project root.
+CLAUDE_PROJECTS = (
+    CLAUDE_PROJECTS_DIRS[0]
+    if CLAUDE_PROJECTS_DIRS
+    else Path("~/.claude/projects").expanduser()
+)
 
 # Keep the embedding model in a stable, gitignored location instead of the OS
 # temp dir (macOS purges temp -> surprise re-downloads). Env override wins.
@@ -54,6 +125,16 @@ os.environ.setdefault("FASTEMBED_CACHE_PATH", str(CACHE_DIR / "fastembed"))
 EMBED_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 EMBED_DIM = 256  # Matryoshka truncation of the 768-dim model output
 EMBED_TEXT_CAP = 2_000  # chars fed to the embedder (full text stays in the DB row)
+# Embedding backfill pages pending rows in bounded chunks so peak RAM is
+# O(chunk), not O(corpus): each chunk's texts + vectors are the only bulk held.
+EMBED_BACKFILL_CHUNK = int(os.environ.get("BRAIN_EMBED_BACKFILL_CHUNK") or "128")
+# onnxruntime intra-op thread cap for the embedder so a single ingest doesn't
+# oversubscribe every core (matters on small-RAM/CPU boxes during a rebuild).
+EMBED_THREADS = int(os.environ.get("BRAIN_EMBED_THREADS") or "4")
+# Inference batch size fed to fastembed/onnxruntime. The backfill chunk only
+# bounds DB paging; THIS bounds the activation arena, which at batch 32 peaks
+# well over 1GB and OOM-kills a 2GB box (the model weights alone are ~550MB).
+EMBED_BATCH = int(os.environ.get("BRAIN_EMBED_BATCH") or "32")
 
 # Ingest / storage
 EPISODE_TEXT_CAP = 20_000  # chars stored per episode

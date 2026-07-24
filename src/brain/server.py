@@ -21,7 +21,6 @@ from .remember import remember as _remember_impl
 mcp = FastMCP("brain")
 
 
-@mcp.tool
 def recall(
     query: str,
     k: int = 6,
@@ -35,8 +34,8 @@ def recall(
 
     Hybrid full-text + semantic search. scope:
     "all" | "episodes" | "memories" | "summaries" ("all" spans all three).
-    Filters: project matches path segments of the session dir (e.g. "mobile"
-    => ~/src/mobile); since/until are "YYYY-MM-DD" or "Nd" (N days ago), inclusive.
+    Filters: project matches path segments of the session dir (e.g. "skills"
+    => ~/src/skills); since/until are "YYYY-MM-DD" or "Nd" (N days ago), inclusive.
     Returns compact hits: kind, id, date, project, snippet, session_id
     (episodes and summaries) or name (memories), and a `score` in (0, 1] (recency-
     and kind-weighted, normalized RRF); hits are score-descending. Episode/memory
@@ -57,7 +56,6 @@ def recall(
         conn.close()
 
 
-@mcp.tool
 def get_episode(id: str) -> dict:
     """Fetch full stored text + metadata for one recall hit.
 
@@ -78,7 +76,6 @@ def get_episode(id: str) -> dict:
         conn.close()
 
 
-@mcp.tool
 def remember(
     fact: str,
     type: str = "project",
@@ -105,6 +102,15 @@ def remember(
         conn.close()
 
 
+# Register the full tool surface. Kept as explicit `mcp.tool(fn)` calls rather than
+# `@mcp.tool` decorators so the plain functions stay importable and re-registerable:
+# the read-only entry point (server_readonly.py) imports `recall`/`get_episode` and
+# registers ONLY those two on its own FastMCP, leaving `remember` unreachable there.
+mcp.tool(recall)
+mcp.tool(get_episode)
+mcp.tool(remember)
+
+
 def _ensure_fresh_index() -> None:
     """Runs in a daemon thread: MCP initialize must never wait on ingest.
     recall serves whatever is already indexed meanwhile (WAL + busy_timeout).
@@ -123,12 +129,23 @@ def _ensure_fresh_index() -> None:
                 conn.close()
             stale = last is None or (time.time() - float(last)) > INGEST_STALE_SECONDS
         if stale:
-            stats = run_ingest(log=lambda s: print(f"[brain] {s}", file=sys.stderr))
-            print(
-                f"[brain] ingest done: {stats['episodes_total']} episodes, "
-                f"{stats['memories_total']} memories in {stats['seconds']}s",
-                file=sys.stderr,
+            # Background caller: never wait on the single-writer lock. If a
+            # manual `brain-ingest`, a session-refresh, or a peer server already
+            # holds it, cleanly no-op — recall serves the existing index.
+            stats = run_ingest(
+                log=lambda s: print(f"[brain] {s}", file=sys.stderr), block=False
             )
+            if stats.get("skipped"):
+                print(
+                    "[brain] startup ingest skipped: another writer holds the lock",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[brain] ingest done: {stats['episodes_total']} episodes, "
+                    f"{stats['memories_total']} memories in {stats['seconds']}s",
+                    file=sys.stderr,
+                )
         # Debt-triggered reflect: AFTER ingest so the debt count reads the
         # freshly-topped index. Runs every startup (not gated on `stale`).
         # Fire-and-forget; self-firewalled — never blocks or breaks initialize.

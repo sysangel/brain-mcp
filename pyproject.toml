@@ -12,9 +12,11 @@ dependencies = [
 [project.scripts]
 brain-ingest = "brain.ingest:main"
 brain-server = "brain.server:main"
+brain-server-readonly = "brain.server_readonly:main"
 brain-hook = "brain.hook:main"
 brain-sync = "brain.sync:main"
 brain-autoreflect = "brain.autoreflect:main"
+brain-freshness-audit = "brain.freshness_audit:main"
 brain-usage-report = "brain.usage_report:main"
 brain-recall = "brain.cli:main"
 brain-remember = "brain.remember_cli:main"

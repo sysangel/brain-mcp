@@ -155,7 +155,24 @@ def _note_epoch(note_path: Path, fm: str, commit_epoch: float | None) -> float |
         return None
 
 
-def _episodes_since(epoch: float, root: Path) -> int | None:
+def parse_note(note_path: Path) -> tuple[str, str, float | None, float | None] | None:
+    """(frontmatter, body, epoch, commit_epoch) for a `<project>-state.md` note,
+    or None when the file can't be read. `epoch` is when the note was written
+    (written:/commit/date/mtime precedence — see _note_epoch); `commit_epoch` is
+    its last brain-repo commit time. Extracted so the SessionStart injection and
+    the freshness auditor derive note freshness through ONE code path — the STALE
+    rule (drift OR episodes_since >= banner) then has a single definition."""
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    fm, body = _split_note(text)
+    commit_epoch = _note_commit_epoch(note_path)
+    epoch = _note_epoch(note_path, fm, commit_epoch)
+    return fm, body, epoch, commit_epoch
+
+
+def episodes_since(epoch: float, root: Path) -> int | None:
     """Non-sidechain episodes for this project recorded after the note.
     Lexical ts compare works because episode ts is UTC ISO with a 'T'
     separator (the same invariant reflect's SQL leans on)."""
@@ -191,7 +208,7 @@ def _episodes_since(epoch: float, root: Path) -> int | None:
         conn.close()
 
 
-def _repo_drift(root: Path, epoch: float) -> bool:
+def repo_drift(root: Path, epoch: float) -> bool:
     """True when the project repo's HEAD is meaningfully newer than the note.
     Callers pass the LATER of the written: stamp and the note's commit time —
     reflect stamps written: at step 7 but commits at step 10, and that
@@ -313,18 +330,15 @@ def _run() -> str:
     cwd = Path(data.get("cwd") or os.getcwd())
     root = _resolve_root(cwd)
     note = MEMORIES_DIR / f"{root.name}-state.md"
-    try:
-        text = note.read_text(encoding="utf-8")
-    except OSError:
+    parsed = parse_note(note)
+    if parsed is None:
         return ""  # quiet: no note for this project, inject nothing
-    fm, body = _split_note(text)
+    _fm, body, epoch, commit_epoch = parsed
     if not body.strip():
         return ""
-    commit_epoch = _note_commit_epoch(note)
-    epoch = _note_epoch(note, fm, commit_epoch)
-    n_since = _episodes_since(epoch, root) if epoch is not None else None
+    n_since = episodes_since(epoch, root) if epoch is not None else None
     drift_epochs = [e for e in (epoch, commit_epoch) if e is not None]
-    drift = _repo_drift(root, max(drift_epochs)) if drift_epochs else False
+    drift = repo_drift(root, max(drift_epochs)) if drift_epochs else False
     return _build_block(
         f"memories/{note.name}",
         body,
@@ -373,7 +387,14 @@ def refresh_main() -> None:
     idempotent ingest work — wasted CPU, never wrong state (WAL, busy_timeout,
     per-file upsert txns, hash-checked embed backfill). The settle sleep lets
     a same-moment server startup ingest stamp `last_ingest` first. Deliberately NO autoreflect:
-    spawning reflect stays the server's job."""
+    spawning reflect stays the server's job.
+
+    Two locks, distinct roles: SESSION_REFRESH_LOCK_PATH (non-blocking, here)
+    dedups refresh-vs-refresh so only one child does the settle+pull+ingest;
+    run_ingest's own single-writer ingest lock (taken block=False below) dedups
+    this refresh against the server startup ingest and a manual brain-ingest —
+    all three compete for the embedder and DB, so the refresh must NEVER wait,
+    only no-op when another writer holds it."""
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         with open(SESSION_REFRESH_LOCK_PATH, "w") as fh:
@@ -395,7 +416,7 @@ def refresh_main() -> None:
                     conn.close()
                 stale = last is None or (time.time() - float(last)) > INGEST_STALE_SECONDS
             if stale:
-                run_ingest(log=lambda s: None)
+                run_ingest(log=lambda s: None, block=False)
     except Exception:
         pass
     sys.exit(0)

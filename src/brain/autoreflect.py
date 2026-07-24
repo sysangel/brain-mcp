@@ -10,9 +10,10 @@ Two entry points funnel through this module:
   `sys.executable -m brain.autoreflect` — no PATH lookup, survives the session
   that spawned it. It never blocks, delays, or breaks MCP `initialize`.
 - `main()` is the console script `brain-autoreflect`: the single choke point that
-  actually runs `claude -p /reflect`. Both the debt spawn and the demoted launchd
-  backstop route through it, so one file lock (`REFLECT_LOCK_PATH`) gives
-  single-flight across every trigger.
+  actually runs `claude -p /reflect`. The debt spawn is the sole trigger (the
+  nightly launchd backstop was retired 2026-07-12); it and any manual
+  `brain-autoreflect` invocation route through here, so one file lock
+  (`REFLECT_LOCK_PATH`) gives single-flight across them.
 
 Recursion guard: `main` sets `BRAIN_NO_AUTOREFLECT=1` on the `claude` child, which
 spawns its own MCP brain-server; that server inherits the env and its own
@@ -43,7 +44,7 @@ from .config import (
 )
 
 # Reflect's tool allowlist — the single source of truth (was inlined in the
-# launchd plist). Both the debt spawn and the demoted backstop share this list.
+# now-retired launchd plist). The debt spawn (the sole reflect trigger) uses it.
 REFLECT_ALLOWED_TOOLS = [
     "Bash(uv:*)",
     "Bash(sqlite3:*)",
@@ -72,7 +73,7 @@ _CLAUDE_FALLBACKS = [
 ]
 
 
-def _resolve_claude() -> str | None:
+def resolve_claude() -> str | None:
     """BRAIN_CLAUDE_BIN override -> `shutil.which("claude")` -> ordered fallback
     probe (first existing executable) -> None. Daemon/launchd PATH may lack
     claude, so `which` alone is not enough."""
@@ -150,7 +151,7 @@ def maybe_trigger(log) -> None:
             conn.close()
         if debt < REFLECT_DEBT_SESSIONS:
             return
-        claude = _resolve_claude()
+        claude = resolve_claude()
         if claude is None:
             log("[brain] autoreflect: claude binary not found; skipping")
             return
@@ -177,9 +178,14 @@ def maybe_trigger(log) -> None:
 def main() -> int:
     """Console script `brain-autoreflect`. Acquires the single-flight flock, then
     (unless `--force`) self-guards against a too-recent reflect, resolves the
-    claude binary, and runs `claude -p /reflect`. `BRAIN_AUTOREFLECT_DRYRUN=1`
-    prints the assembled command and exits without spawning claude."""
+    claude binary, and runs `claude -p /reflect`. `--if-debt` additionally
+    requires the reflection debt to clear `REFLECT_DEBT_SESSIONS` — the same
+    gate `maybe_trigger` applies before spawning — so a dumb timer can invoke
+    this frequently and only pay for a reflect when one is owed.
+    `BRAIN_AUTOREFLECT_DRYRUN=1` prints the assembled command and exits without
+    spawning claude."""
     force = "--force" in sys.argv
+    if_debt = "--if-debt" in sys.argv
     REFLECT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     fh = open(REFLECT_LOCK_PATH, "w")  # held for this process's whole lifetime
     try:
@@ -187,14 +193,30 @@ def main() -> int:
     except OSError:
         print("[autoreflect] a reflect is already running — skipping")
         return 0
-    if not force:  # backstop self-guard: skip if a recent reflect already ran
+    if not force:  # self-guard: skip if a recent reflect already ran
         last = _last_reflect()
         if last is not None:
             age_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600
             if age_h < REFLECT_MIN_AGE_H:
                 print("[autoreflect] last reflect too recent — skipping")
                 return 0
-    claude = _resolve_claude()
+    if if_debt:  # timer-friendly gate: reflect only when debt is owed
+        if not DB_PATH.exists():
+            print("[autoreflect] --if-debt: no index db — skipping")
+            return 0
+        conn = db.connect_ro()
+        if conn is None:
+            print("[autoreflect] --if-debt: index unreadable — skipping")
+            return 0
+        try:
+            debt = _debt(conn, _last_reflect())
+        finally:
+            conn.close()
+        if debt < REFLECT_DEBT_SESSIONS:
+            print(f"[autoreflect] --if-debt: debt={debt} < {REFLECT_DEBT_SESSIONS} — skipping")
+            return 0
+        print(f"[autoreflect] --if-debt: debt={debt} — reflecting")
+    claude = resolve_claude()
     if claude is None:
         print("[autoreflect] claude binary not found", file=sys.stderr)
         return 1
@@ -230,20 +252,20 @@ def main() -> int:
             f"[autoreflect] reflect exceeded {timeout_s:.0f}s — killing process group, giving up",
             file=sys.stderr,
         )
-        _kill_group(proc)
+        kill_group(proc)
         return 1
     except BaseException:
         # Any OTHER abnormal exit (KeyboardInterrupt, SystemExit, an unexpected
         # error) must not leave the detached group running after the flock
         # releases to race the next reflect — mirror subprocess.run's
         # kill-on-exception. Normal completion returns above and kills nothing.
-        _kill_group(proc)
+        kill_group(proc)
         raise
     # flock auto-releases when fh closes / this process dies (clean OR crash) —
     # no TTL, no stale-lock reclaim (matches sync.py:maybe_pull doctrine).
 
 
-def _kill_group(proc: subprocess.Popen) -> None:
+def kill_group(proc: subprocess.Popen) -> None:
     """SIGTERM the child's whole process group, give it a few seconds to drain,
     then SIGKILL any survivors. Guards against the group already being gone
     (ProcessLookupError) at every step."""

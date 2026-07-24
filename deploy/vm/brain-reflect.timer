@@ -1,0 +1,10 @@
+[Unit]
+Description=brain: hourly ingest + debt-triggered reflect
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

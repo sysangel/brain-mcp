@@ -359,6 +359,10 @@ commits all of `memories/`, which now includes `*-state.md` and
 
 ### 6. Demoting the launchd job to a backstop (Part 2)
 
+> **SUPERSEDED 2026-07-12:** the launchd backstop was retired; the debt check at
+> brain-server startup is now the sole reflect trigger. The design below is kept
+> as an as-built historical record.
+
 The 03:30 job is **kept as a backstop, not removed**. Two changes to
 `scripts/brain-reflect.plist.template`:
 

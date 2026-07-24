@@ -28,7 +28,7 @@ from .config import (
     RRF_K,
     SNIPPET_WIDTH,
     VEC_FLOOR_COS,
-    CLAUDE_PROJECTS,
+    CLAUDE_PROJECTS_DIRS,
 )
 
 # RETURNING (upsert re-ingest) needs SQLite >= 3.35 — fail loudly if the
@@ -427,7 +427,7 @@ def make_snippet(text: str, query: str, width: int = SNIPPET_WIDTH) -> str:
 
 def _norm_segments(s: str) -> str:
     """Hyphen-bounded, lowercase, hyphen-separated segment string for
-    substring segment matching: "/Users/x/src/webapp" -> "-users-x-src-webapp-".
+    substring segment matching: "/Users/x/src/myrepo" -> "-users-x-src-myrepo-".
     Munged transcript dirs ("-Users-x-src") normalize to the same form."""
     return "-" + s.lower().replace("/", "-").strip("-") + "-"
 
@@ -440,13 +440,17 @@ def _project_matches(filter: str, row_project: str) -> bool:
 
 def _memory_project(path: str) -> str:
     """Project label for a memory: the Claude project dir name when the file is
-    under CLAUDE_PROJECTS, else "brain" for <BRAIN_DIR>/memories/*.md. Shared by
-    display (_project_of) and filtering (_filter_ids) so they can't drift."""
-    try:
-        rel = Path(path).relative_to(CLAUDE_PROJECTS)
-        return rel.parts[0]
-    except ValueError:
-        return "brain"
+    under any CLAUDE_PROJECTS root, else "brain" for <BRAIN_DIR>/memories/*.md.
+    Shared by display (_project_of) and filtering (_filter_ids) so they can't
+    drift. Checks every scanned root (the CLAUDE_CONFIG_DIR migration split
+    sessions across ~/.claude and ~/.claude-work)."""
+    p = Path(path)
+    for base in CLAUDE_PROJECTS_DIRS:
+        try:
+            return p.relative_to(base).parts[0]
+        except ValueError:
+            continue
+    return "brain"
 
 
 def _project_of(row: sqlite3.Row, kind: str) -> str:

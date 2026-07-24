@@ -232,11 +232,81 @@ def _oneline(s: str) -> str:
     return " ".join((s or "").split())[:200]
 
 
+def _commit_relpath(p) -> str:
+    """A pathspec relative to BRAIN_DIR. Absolute paths under the repo are
+    relativized (tolerating a symlinked repo root); already-relative pathspecs
+    and anything outside the repo pass through unchanged."""
+    p = Path(p)
+    for base in (BRAIN_DIR, BRAIN_DIR.resolve()):
+        try:
+            return str(p.relative_to(base))
+        except ValueError:
+            try:
+                return str(p.resolve().relative_to(base))
+            except ValueError:
+                continue
+    return str(p)
+
+
+def commit_paths(paths, message: str, trailers=None) -> tuple[bool, bool, str]:
+    """Pathspec-limited add+commit of `paths` (files or dirs, absolute or
+    repo-relative) under one commit. `message` is the subject/body; `trailers`
+    (optional list) is appended as a trailer block. Retries up to 3x with 300ms
+    backoff on index.lock contention. Returns (ok, committed, err):
+      ok        — False only on a hard git failure (not index.lock contention);
+      committed — True iff a new commit was actually created; a clean tree with
+                  nothing staged for these paths is a (True, False, "") no-op
+                  (idempotent re-emit / re-remember);
+      err       — stderr one-liner on failure, else "".
+    Never raises — the on-disk markdown/episode files are the durable artifact,
+    so a failed commit is reported and the next cycle retries."""
+    rels = [_commit_relpath(p) for p in paths]
+    msg = message
+    if trailers:
+        msg += "\n\n" + "\n".join(trailers)
+    last_err = ""
+    for attempt in range(3):
+        try:
+            add = subprocess.run(
+                ["git", "-C", str(BRAIN_DIR), "add", "--", *rels],
+                capture_output=True, text=True, timeout=15,
+            )
+            if add.returncode != 0:
+                last_err = _oneline(add.stderr)
+                if "index.lock" in add.stderr and attempt < 2:
+                    time.sleep(0.3)
+                    continue
+                return (False, False, last_err)
+            # Nothing staged for these pathspecs -> clean no-op (git commit would
+            # fail "nothing to commit"). --quiet exits 0 with no staged diff, 1
+            # with one; treat only exit 1 as "there is something to commit".
+            diff = subprocess.run(
+                ["git", "-C", str(BRAIN_DIR), "diff", "--cached", "--quiet", "--", *rels],
+                capture_output=True, text=True, timeout=10,
+            )
+            if diff.returncode == 0:
+                return (True, False, "")
+            commit = subprocess.run(
+                ["git", "-C", str(BRAIN_DIR), "commit", "-m", msg, "--", *rels],
+                capture_output=True, text=True, timeout=15,
+            )
+            if commit.returncode == 0:
+                return (True, True, "")
+            last_err = _oneline(commit.stderr or commit.stdout)
+            if "index.lock" in (commit.stderr + commit.stdout) and attempt < 2:
+                time.sleep(0.3)
+                continue
+            return (False, False, last_err)
+        except (OSError, subprocess.SubprocessError) as e:
+            return (False, False, _oneline(str(e)))
+    return (False, False, last_err or "git index.lock contention after retries")
+
+
 def commit_memory(path: Path, slug: str, description: str, session: str, project: str):
     """Pathspec-limited add+commit of one memory file with provenance trailers.
-    Returns (ok, err). Retries up to 3x with 300ms backoff on index.lock
-    contention; on any other git failure returns (False, <stderr>) without
-    raising — the markdown on disk is the durable artifact."""
+    Returns (ok, err). Delegates the add+commit+index.lock-retry to commit_paths;
+    on any non-recoverable git failure returns (False, <stderr>) without raising —
+    the markdown on disk is the durable artifact."""
     trailers = []
     # Collapse newlines/whitespace so a value can't forge or break trailers
     # (argv subprocess, so no shell injection — this is provenance integrity).
@@ -250,37 +320,9 @@ def commit_memory(path: Path, slug: str, description: str, session: str, project
     msg = f"remember: {slug}"
     if description:
         msg += f"\n\n{description}"
-    msg += "\n\n" + "\n".join(trailers)
 
-    rel = f"memories/{slug}.md"
-    last_err = ""
-    for attempt in range(3):
-        try:
-            add = subprocess.run(
-                ["git", "-C", str(BRAIN_DIR), "add", "--", rel],
-                capture_output=True, text=True, timeout=10,
-            )
-            if add.returncode != 0:
-                last_err = _oneline(add.stderr)
-                if "index.lock" in add.stderr and attempt < 2:
-                    time.sleep(0.3)
-                    continue
-                return (False, last_err)
-            commit = subprocess.run(
-                ["git", "-C", str(BRAIN_DIR), "commit", "-m", msg, "--", rel],
-                capture_output=True, text=True, timeout=10,
-            )
-            if commit.returncode == 0:
-                return (True, "")
-            last_err = _oneline(commit.stderr or commit.stdout)
-            if "index.lock" in (commit.stderr + commit.stdout) and attempt < 2:
-                time.sleep(0.3)
-                continue
-            return (False, last_err)
-        except (OSError, subprocess.SubprocessError) as e:
-            last_err = _oneline(str(e))
-            return (False, last_err)
-    return (False, last_err or "git index.lock contention after retries")
+    ok, _committed, err = commit_paths([f"memories/{slug}.md"], msg, trailers)
+    return (ok, err)
 
 
 # -------------------------------------------------------- orchestration ---

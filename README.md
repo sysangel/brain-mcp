@@ -43,7 +43,10 @@ index is a rebuildable cache you can delete at any time.
   (preferences, runbooks, per-project state notes). `summaries/YYYY-MM/*.md`
   are per-session digests. **Episodes** are ingested Claude Code transcripts
   (read from `~/.claude/projects/**.jsonl`). The first two are git-tracked
-  text you own; episodes derive from live transcripts.
+  text you own; episodes derive from live transcripts — though on an emitting
+  host, ingest also writes each episode as a git-tracked file under
+  `episodes/YYYY/MM/`, so a transcript-less machine can index them by
+  `git pull` alone (see [Running across two machines](#running-across-two-machines-split-host)).
 - **The index is a cache.** `cache/brain.db` holds an FTS5 table and a
   `sqlite-vec` table of 256-dimension [nomic-embed-text-v1.5][nomic] vectors
   (Matryoshka-truncated from 768). It is **always rebuildable** and **never
@@ -96,6 +99,11 @@ Register the MCP server with Claude Code (or any MCP client that speaks stdio):
 claude mcp add brain -- uv run --directory "$PWD" brain-server
 ```
 
+> Need a **read-only** server — e.g. behind a gate that requires every exposed
+> tool to be auto-allowable? Register `brain-server-readonly` instead; it
+> exposes only `recall` + `get_episode`, dropping the `remember` write that
+> such a gate would reject.
+
 Write a fact mid-session from the shell (`brain-remember` reads one JSON object
 from stdin — only `fact` is required):
 
@@ -115,8 +123,9 @@ Every entry point is a console script; run it with `uv run <name>`.
 
 | Command                | What it does                                                             |
 |------------------------|--------------------------------------------------------------------------|
-| `brain-ingest`         | Incrementally index memories, summaries, and transcripts (`--full` rebuilds). |
+| `brain-ingest`         | Incrementally index memories, summaries, and episodes — from live transcripts or committed episode files (`--full` rebuilds). |
 | `brain-server`         | MCP stdio server exposing `recall`, `get_episode`, `remember`.           |
+| `brain-server-readonly`| Read-only MCP stdio server: `recall` + `get_episode` only (no `remember`). |
 | `brain-recall`         | Hybrid search / full-text fetch from the shell (no MCP needed).          |
 | `brain-remember`       | Write a durable memory from the shell (dedup-guarded, auto-commits).     |
 | `brain-sync`           | `status` / `pull` / `push` against the optional private remote.          |
@@ -124,6 +133,7 @@ Every entry point is a console script; run it with `uv run <name>`.
 | `brain-hook`           | `UserPromptSubmit` hook: ambient auto-recall (Claude-Code-specific).     |
 | `brain-session-start`  | `SessionStart` hook: injects a project's state note (Claude-Code-specific). |
 | `brain-autoreflect`    | Wrapper that triggers a headless consolidation pass when debt accrues.   |
+| `brain-freshness-audit`| Refreshes `memories/*-state.md` notes that have fallen behind their project. |
 
 ## Memory file format
 
@@ -158,9 +168,17 @@ All configuration is environment variables with sensible defaults — see
 | Variable                              | Default              | Purpose                                        |
 |---------------------------------------|----------------------|------------------------------------------------|
 | `BRAIN_DIR`                           | the repo root        | Root of the markdown store + `cache/`.         |
-| `BRAIN_CLAUDE_PROJECTS`               | `~/.claude/projects` | Transcript root ingested as episodes.          |
+| `BRAIN_CLAUDE_PROJECTS`               | `~/.claude/projects` `+ ~/.claude-work/projects` | Colon-separated list of transcript roots (each included only if it exists). |
+| `BRAIN_INGEST_SOURCE`                 | `auto`               | Episode source: `auto` / `episodes` / `transcripts` (see [split-host](#running-across-two-machines-split-host)). |
+| `BRAIN_EPISODE_EXCLUDE`               | inherits `BRAIN_DIGEST_EXCLUDE` | Comma-separated cwd/project substrings whose episodes get **no** git-tracked `episodes/` file (still indexed in the local cache DB). |
 | `FASTEMBED_CACHE_PATH`                | `cache/fastembed/`   | Where the embedding model is cached.           |
+| `BRAIN_EMBED_BATCH`                   | `32`                 | Embedder inference batch size; lower it on small-RAM boxes (32 can OOM a 2 GB box). |
+| `BRAIN_EMBED_THREADS`                 | `4`                  | onnxruntime intra-op thread cap for the embedder. |
+| `BRAIN_EMBED_BACKFILL_CHUNK`          | `128`                | DB paging chunk size for the embedding backfill. |
 | `BRAIN_SYNC`                          | on (if remote set)   | `0` hard-disables all git sync.                |
+| `BRAIN_NO_AUTOREFLECT`                | unset                | `1` disables the in-process debt-spawn reflect trigger (set on the emitting server + reflect/refresh children). |
+| `BRAIN_AUDIT_MAX_REFRESH`             | `3`                  | Max freshness-audit refresh agents per run.    |
+| `BRAIN_AUDIT_REFRESH_TIMEOUT`         | `1800`               | Per-refresh-agent timeout (seconds) in the freshness audit. |
 | `BRAIN_RRF_K`                         | `60`                 | Reciprocal-rank-fusion damping constant.       |
 | `BRAIN_KIND_WEIGHT_{MEMORY,SUMMARY,EPISODE}` | `1.0 / 0.85 / 0.70` | Per-kind rank multipliers.               |
 | `BRAIN_HALF_LIFE_{MEMORY,SUMMARY,EPISODE}`   | `180 / 90 / 45` days | Per-kind recency half-lives.             |
@@ -180,9 +198,11 @@ them.
 - **Skills** — [`skills/reflect`](skills/reflect) (consolidation pass),
   [`skills/catchup`](skills/catchup) (deep resume), and
   [`skills/handoff`](skills/handoff).
-- **launchd backstop** — [`scripts/install-launchd.sh`](scripts/install-launchd.sh)
-  installs a nightly reflection job on macOS (rendered from a template; a
-  no-op backstop to the primary debt-triggered path).
+- **Reflect triggering** — on a workstation, consolidation is triggered solely
+  by the in-process *reflection-debt* spawn from the MCP server (no cron or
+  scheduled job); on an always-on box, a systemd timer runs
+  `brain-autoreflect --if-debt`. See
+  [Running across two machines](#running-across-two-machines-split-host).
 
 Design docs for these live under [`specs/`](specs).
 
@@ -209,13 +229,77 @@ design.
 Memory commits record provenance as git trailers (`Session`, `Project`,
 `Host`) so you can audit which machine and session produced each fact.
 
+## Running across two machines (split-host)
+
+The store is built to run split across an **emitting workstation** and an
+**always-on box** (a small VM), both talking to the same markdown store through
+the private remote from
+[How multi-machine sync works](#how-multi-machine-sync-works-optional). They
+divide the labour:
+
+- **The workstation emits.** It has the live Claude Code transcripts, so its
+  `brain-ingest` parses them, writes new memories, and — the key part — emits
+  one markdown file per episode under `episodes/YYYY/MM/<id>.md`. Unlike
+  `cache/` (gitignored), `episodes/` is **git-tracked and committed** (as
+  `brain-ingest: emit N episodes`) and pushed to the remote. The workstation
+  runs its MCP server with `BRAIN_NO_AUTOREFLECT=1`, so it never spends a
+  reflect itself — it delegates that to the box.
+- **The always-on box indexes.** It has no transcripts of its own, so it
+  `git pull`s and indexes straight from the committed episode files, then runs
+  the maintenance loops on a timer. It sets `BRAIN_INGEST_SOURCE=episodes` so
+  ingest reads `episodes/**/*.md` only and never scans, emits, or commits
+  transcripts — important because the box accrues its own `claude -p` reflect
+  transcripts that `auto` would otherwise wrongly index and re-emit.
+
+### Episode source selection (`BRAIN_INGEST_SOURCE`)
+
+| Value            | Behaviour                                                              |
+|------------------|------------------------------------------------------------------------|
+| `auto` (default) | If transcripts are present, transcript mode (parse + emit episode files); otherwise, if episode files are present, episode-file mode. |
+| `episodes`       | Index `episodes/**/*.md` **only** — never scan, emit, or commit transcripts. |
+| `transcripts`    | Force transcript mode.                                                  |
+
+A transcript-less box therefore stays current on episodes purely by `git pull`.
+See [`specs/episodes-in-git.md`](specs/episodes-in-git.md).
+
+### reflect triggering
+
+There is no nightly cron or scheduled OS job. reflect is triggered one way per host:
+
+- **On the workstation**, solely by the in-process *reflection-debt* spawn from
+  the MCP server: when accrued debt crosses the threshold, the server spawns a
+  headless consolidation pass. `BRAIN_NO_AUTOREFLECT=1` disables it (as the
+  split-host workstation does).
+- **On the always-on box**, by a systemd timer running
+  `brain-autoreflect --if-debt` — a debt-gated reflect that only spends a
+  `claude -p /reflect` when reflection debt has actually accrued.
+
+### systemd timers (`deploy/vm/`)
+
+The [`deploy/vm/`](deploy/vm) dir ships user-level systemd units (plus a README)
+for the always-on box:
+
+- **`brain-reflect.timer`** (hourly, jittered) runs `brain-ingest`, then
+  `brain-autoreflect --if-debt`.
+- **`brain-freshness-audit.timer`** (daily) runs `brain-ingest`, then
+  `brain-freshness-audit`: it sweeps the `memories/*-state.md` project notes,
+  reuses the SessionStart **STALE** rule (repo drift *or* enough new episodes
+  since the note was written) to find notes that have fallen behind their
+  project, and dispatches one Opus refresh agent per stale note to rewrite it
+  in-format and auto-land it. Runs are bounded by `BRAIN_AUDIT_MAX_REFRESH`
+  (default 3) agents; contradictions, archival candidates, and filename
+  mapping-failures are written out as `proposals/needs-user-<date>-<note>.md`
+  for a human instead.
+
 ## Scope & honesty
 
 - **Single-user personal project.** Extracted from a working personal system
   and published with **fresh git history** — not a hardened multi-tenant
   service.
-- **Developed on macOS.** The core is pure Python and portable; only the
-  launchd nightly job is macOS-specific, and it is optional.
+- **Developed on macOS.** The core is pure Python and portable. The only
+  platform-specific pieces are optional deployment glue: the workstation runs
+  on macOS, and the always-on box uses Linux user-level systemd units
+  ([`deploy/vm/`](deploy/vm)).
 - **Local embeddings.** Vectors are computed locally via
   [fastembed](https://github.com/qdrant/fastembed) — no API key and no
   external inference calls. (CI runs FTS-only, since the model download and

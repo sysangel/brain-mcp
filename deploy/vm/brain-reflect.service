@@ -1,0 +1,21 @@
+[Unit]
+Description=brain: pull + ingest episode files, then debt-triggered reflect
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/src/brain-mcp
+# CLAUDE_CODE_OAUTH_TOKEN for the headless `claude -p /reflect` child
+EnvironmentFile=%h/.config/claude.env
+# The VM ingests from episodes/ (git transport) — never from its own local
+# claude transcripts, which exist here because reflect itself runs claude.
+Environment=BRAIN_INGEST_SOURCE=episodes
+# 2GB droplet: a single embedder thread + small backfill chunk keep peak RAM
+# under the swap ceiling (the seed ingest was OOM-killed at THREADS=2).
+Environment=BRAIN_EMBED_THREADS=1
+Environment=BRAIN_EMBED_BACKFILL_CHUNK=32
+Environment=BRAIN_EMBED_BATCH=4
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/uv run --directory %h/src/brain-mcp brain-ingest
+ExecStart=%h/.local/bin/uv run --directory %h/src/brain-mcp brain-autoreflect --if-debt
+# reflect self-bounds at BRAIN_REFLECT_TIMEOUT (1800s); headroom for ingest
+TimeoutStartSec=3600

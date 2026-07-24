@@ -15,7 +15,7 @@ import os
 import threading
 from pathlib import Path
 
-from .config import EMBED_DIM, EMBED_MODEL, EMBED_TEXT_CAP
+from .config import EMBED_BATCH, EMBED_DIM, EMBED_MODEL, EMBED_TEXT_CAP, EMBED_THREADS
 
 _model = None
 _model_lock = threading.Lock()
@@ -33,7 +33,13 @@ def _get_model():
             cache = os.environ.get("FASTEMBED_CACHE_PATH")
             if cache:
                 Path(cache).mkdir(parents=True, exist_ok=True)
-            _model = TextEmbedding(model_name=EMBED_MODEL)
+            # Cap onnxruntime intra-op threads so a single ingest doesn't
+            # saturate every core. `threads` is fastembed's onnxruntime
+            # intra_op_num_threads knob; fall back if an API drops the kwarg.
+            try:
+                _model = TextEmbedding(model_name=EMBED_MODEL, threads=EMBED_THREADS)
+            except TypeError:
+                _model = TextEmbedding(model_name=EMBED_MODEL)
     return _model
 
 
@@ -61,7 +67,7 @@ def embed_documents(texts: list[str]) -> list:
     """Embed corpus texts (batched). Input is truncated to EMBED_TEXT_CAP chars."""
     model = _get_model()
     prefixed = [DOC_PREFIX + t[:EMBED_TEXT_CAP] for t in texts]
-    return [_finalize(v) for v in model.embed(prefixed, batch_size=32)]
+    return [_finalize(v) for v in model.embed(prefixed, batch_size=EMBED_BATCH)]
 
 
 def embed_query(text: str):
