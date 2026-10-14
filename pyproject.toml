@@ -13,6 +13,7 @@ dependencies = [
 brain-ingest = "brain.ingest:main"
 brain-server = "brain.server:main"
 brain-server-readonly = "brain.server_readonly:main"
+brain-server-static-readonly = "brain.server_static_readonly:main"
 brain-hook = "brain.hook:main"
 brain-sync = "brain.sync:main"
 brain-autoreflect = "brain.autoreflect:main"

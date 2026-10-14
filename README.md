@@ -117,6 +117,39 @@ echo '{"fact": "Staging DB resets nightly at 03:00 UTC.", "type": "reference"}' 
 > gitignored). Subsequent runs are instant. Everything runs locally — no API
 > key, no external inference calls.
 
+## Isolated empty store for external MCP clients
+
+Use a **new, dedicated directory**, not this package checkout, the example
+store, an existing brain checkout, or a symlink to any of them. A fresh store
+has no memories, summaries, or episodes to index. The package and its store
+are separate paths; do not copy personal brain data into the new store.
+
+```sh
+BRAIN_PACKAGE=/absolute/path/to/brain-mcp   # public package checkout
+export BRAIN_DIR="$HOME/.local/share/brain-mcp-external"
+export BRAIN_CLAUDE_PROJECTS="$BRAIN_DIR/empty-claude-projects"
+export BRAIN_INGEST_SOURCE=episodes          # episode files, not transcripts
+export BRAIN_SYNC=0                          # never pull/push a git remote
+export BRAIN_NO_AUTOREFLECT=1                # no background reflection
+mkdir -p "$BRAIN_DIR" "$BRAIN_CLAUDE_PROJECTS"
+uv run --directory "$BRAIN_PACKAGE" brain-ingest --full
+```
+
+Pass those **same five variables and their persistent absolute directory paths**
+through the MCP client's per-server environment; do not use a fresh temporary
+path on every launch. **Never omit `BRAIN_CLAUDE_PROJECTS`:** even in episode-file
+mode, ingest scans Claude project memory Markdown under the default
+`~/.claude/projects` and `~/.claude-work/projects` roots. Set the client's stdio
+executable to `uv`, with arguments
+`["run", "--directory", "/absolute/path/to/brain-mcp", "brain-server-static-readonly"]`.
+Pin **`brain-server-static-readonly`**, the static read-only entrypoint, rather than
+`brain-server` (which exposes `remember`) or `brain-server-readonly` (which
+still starts background ingest). The static server does not update the index;
+run `brain-ingest` explicitly after adding material to the isolated store. Explicitly ingest
+only data you place in the isolated store. A synthetic-canary test verifies
+that the explicit empty Claude-project override keeps both transcripts and
+Claude memories out, while omitting it would index Claude memories.
+
 ## Commands
 
 Every entry point is a console script; run it with `uv run <name>`.
