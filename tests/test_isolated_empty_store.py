@@ -15,7 +15,7 @@ import pytest
 
 
 @pytest.mark.parametrize("override_projects", [True, False])
-def test_external_client_empty_store_ignores_default_transcripts_and_other_store(
+def test_external_client_requires_empty_claude_projects_override(
     tmp_path, override_projects,
 ):
     home = tmp_path / "home"
@@ -30,6 +30,13 @@ def test_external_client_empty_store_ignores_default_transcripts_and_other_store
             "timestamp": "2026-01-01T00:00:00Z",
             "cwd": "/synthetic-private-project",
         }) + "\n", encoding="utf-8")
+        memory_dir = root / "memory"
+        memory_dir.mkdir()
+        (memory_dir / "leak-canary.md").write_text(
+            "---\nname: leak-canary\ndescription: synthetic Claude memory\n---\n"
+            "synthetic private memory must stay out of the index\n",
+            encoding="utf-8",
+        )
 
     private_memory = tmp_path / "private-brain" / "memories"
     private_memory.mkdir(parents=True)
@@ -49,7 +56,6 @@ def test_external_client_empty_store_ignores_default_transcripts_and_other_store
         "BRAIN_INGEST_SOURCE": "episodes",
         "BRAIN_SYNC": "0",
         "BRAIN_NO_AUTOREFLECT": "1",
-        "BRAIN_SCOPE": "personal",
         "FASTEMBED_CACHE_PATH": str(tmp_path / "models"),
     }
     if not override_projects:
@@ -71,6 +77,7 @@ def test_external_client_empty_store_ignores_default_transcripts_and_other_store
                 table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                 for table in ("files", "episodes", "memories", "summaries")
             },
+            "memory_texts": [row[0] for row in conn.execute("SELECT text FROM memories")],
         }
         conn.close()
         print(json.dumps(result))
@@ -87,11 +94,19 @@ def test_external_client_empty_store_ignores_default_transcripts_and_other_store
         ]
     )
     assert result["source"] == "episodes"
-    assert result["stats"]["files_seen"] == 0
+    assert result["stats"]["files_seen"] == (0 if override_projects else 2)
     assert result["stats"]["episodes_added"] == 0
-    assert result["counts"] == dict.fromkeys(
-        ("files", "episodes", "memories", "summaries"), 0
-    )
+    assert result["counts"] == {
+        "files": 0 if override_projects else 2,
+        "episodes": 0,
+        "memories": 0 if override_projects else 2,
+        "summaries": 0,
+    }
+    if override_projects:
+        assert result["memory_texts"] == []
+    else:
+        assert all("synthetic private memory" in t for t in result["memory_texts"])
+    assert all("synthetic secret" not in t for t in result["memory_texts"])
     assert (store / "cache" / "brain.db").is_file()
     assert not list(empty_projects.iterdir())
     assert (private_memory / "private-canary.md").is_file()
