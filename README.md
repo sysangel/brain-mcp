@@ -117,6 +117,38 @@ echo '{"fact": "Staging DB resets nightly at 03:00 UTC.", "type": "reference"}' 
 > gitignored). Subsequent runs are instant. Everything runs locally — no API
 > key, no external inference calls.
 
+## Isolated empty store for external MCP clients
+
+Use a **new, dedicated directory**, not this package checkout, the example
+store, an existing brain checkout, or a symlink to any of them. A fresh store
+has no memories, summaries, or episodes to index. The package and its store
+are separate paths; do not copy personal brain data into the new store.
+
+```sh
+BRAIN_PACKAGE=/absolute/path/to/brain-mcp  # public package checkout
+export BRAIN_DIR="$(mktemp -d)"             # dedicated empty store; keep this path
+export BRAIN_CLAUDE_PROJECTS="$(mktemp -d)" # fresh empty override; keep this path
+export BRAIN_INGEST_SOURCE=episodes         # only BRAIN_DIR/episodes/**/*.md
+export BRAIN_SYNC=0                         # never pull/push a git remote
+export BRAIN_NO_AUTOREFLECT=1               # no background reflection
+export BRAIN_SCOPE=personal                 # external-client static server scope
+uv run --directory "$BRAIN_PACKAGE" brain-ingest --full
+```
+
+Pass those **same six variables and their persistent absolute directory paths**
+through the MCP client's per-server environment; do not use a fresh `mktemp`
+path on every launch or omit `BRAIN_CLAUDE_PROJECTS` (which otherwise defaults
+to `~/.claude/projects` and `~/.claude-work/projects`). Set the client's stdio
+executable to `uv`, with arguments
+`["run", "--directory", "/absolute/path/to/brain-mcp", "brain-server-static"]`.
+Pin **`brain-server-static`**, the static read-only entrypoint, rather than
+`brain-server` (which exposes `remember`) or `brain-server-readonly` (which
+still starts background ingest). The static entrypoint is added separately;
+**do not substitute another server until it is installed**. Explicitly ingest
+only data you place in the isolated store. A test with synthetic transcript
+canaries under both default Claude roots and a separate synthetic brain store
+verifies that the setup above indexes none of them.
+
 ## Commands
 
 Every entry point is a console script; run it with `uv run <name>`.
