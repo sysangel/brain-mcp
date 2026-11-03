@@ -15,7 +15,7 @@ embedder is stubbed deterministic (or absent) so nothing hits the network.
 
 from __future__ import annotations
 
-import fcntl
+from brain import _flock as fcntl
 import json
 
 import numpy as np

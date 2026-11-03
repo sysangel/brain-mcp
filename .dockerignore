@@ -1,0 +1,17 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+cache
+local
+episodes
+memories
+summaries
+proposals
+handoffs
+state
+skills
+tests
+*.db
+*.db-wal
+*.db-shm

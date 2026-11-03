@@ -38,7 +38,7 @@ def _user_line(session, uuid, ts, text, cwd="/proj"):
 
 def _write_transcript(path, episodes):
     """episodes: list of (session, uuid, ts, user_text[, cwd])."""
-    path.write_text("\n".join(_user_line(*e) for e in episodes) + "\n")
+    path.write_text("\n".join(_user_line(*e) for e in episodes) + "\n", newline="\n")
 
 
 def _wire(monkeypatch, tmp_path, transcripts, episodes_dir):
@@ -95,7 +95,7 @@ def _put_episode_file(episodes_dir, row):
     )
     dest = episodes_dir / ingest._episode_shard(row["ts"]) / f"{row['stable_id']}.md"
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(content, encoding="utf-8")
+    dest.write_text(content, encoding="utf-8", newline="\n")
     return dest
 
 
@@ -146,7 +146,7 @@ def test_emit_overwrites_in_place_on_change(tmp_path, monkeypatch):
 
 def test_parse_rejects_non_episode_file(tmp_path):
     junk = tmp_path / "junk.md"
-    junk.write_text("no frontmatter here\njust text\n")
+    junk.write_text("no frontmatter here\njust text\n", newline="\n")
     assert ingest.parse_episode_file(junk) is None
 
 

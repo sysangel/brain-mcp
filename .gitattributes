@@ -1,2 +1,3 @@
 memories/*.md  merge=union
 proposals/*.md merge=union
+* text=auto eol=lf

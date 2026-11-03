@@ -10,9 +10,10 @@ Two entry points funnel through this module:
   `sys.executable -m brain.autoreflect` — no PATH lookup, survives the session
   that spawned it. It never blocks, delays, or breaks MCP `initialize`.
 - `main()` is the console script `brain-autoreflect`: the single choke point that
-  actually runs `claude -p /reflect`. The debt spawn is the sole trigger (the
-  nightly launchd backstop was retired 2026-07-12); it and any manual
-  `brain-autoreflect` invocation route through here, so one file lock
+  actually runs `claude -p /reflect-run`. Triggers are the debt spawn above and
+  manual invocation (`/reflect` shells out to `brain-autoreflect --force`
+  detached; the launchd backstop that used to run this on a 03:30 timer was
+  retired 2026-07-12). Every path routes through here, so one file lock
   (`REFLECT_LOCK_PATH`) gives single-flight across them.
 
 Recursion guard: `main` sets `BRAIN_NO_AUTOREFLECT=1` on the `claude` child, which
@@ -22,7 +23,8 @@ spawns its own MCP brain-server; that server inherits the env and its own
 
 from __future__ import annotations
 
-import fcntl
+import argparse
+from brain import _flock as fcntl
 import math
 import os
 import shutil
@@ -32,19 +34,19 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import db
+from . import db, reflect_window
 from .config import (
     AUTOREFLECT_LOG,
     BRAIN_DIR,
     DB_PATH,
-    LAST_REFLECT_PATH,
     REFLECT_DEBT_SESSIONS,
     REFLECT_LOCK_PATH,
     REFLECT_MIN_AGE_H,
 )
 
 # Reflect's tool allowlist — the single source of truth (was inlined in the
-# now-retired launchd plist). The debt spawn (the sole reflect trigger) uses it.
+# now-retired launchd plist). Every headless pass runs under it, whether started
+# by the debt spawn or by a manual `--force`.
 REFLECT_ALLOWED_TOOLS = [
     "Bash(uv:*)",
     "Bash(sqlite3:*)",
@@ -90,21 +92,12 @@ def resolve_claude() -> str | None:
 
 
 def _last_reflect() -> datetime | None:
-    """Parse `cache/last-reflect` (a single-line ISO-8601 UTC-`Z` timestamp) into
-    an aware UTC datetime, or None if the file is missing / empty / unparseable."""
-    try:
-        raw = LAST_REFLECT_PATH.read_text().strip()
-    except OSError:
-        return None
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    """Newest known reflect completion across hosts: the committed
+    state/last-reflect watermark with the legacy host-local cache stamp as
+    fallback (reflect_window.read_watermark). Cross-host visibility is the
+    point — a VM reflect now satisfies the Mac's debt/age gates too, instead
+    of each host reflecting off its own private stamp."""
+    return reflect_window.read_watermark()
 
 
 def _iso_z(dt: datetime) -> str:
@@ -175,17 +168,43 @@ def maybe_trigger(log) -> None:
         log(f"[brain] autoreflect: skipped ({e})")
 
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Kept separate from `main` so `--help` is a real, harmless exit path — a
+    bare `brain-autoreflect` starts a 10+ minute Opus pass, so an unparsed flag
+    must never fall through into one."""
+    p = argparse.ArgumentParser(
+        prog="brain-autoreflect",
+        description="Run the brain's consolidation pass headless "
+                    "(`claude -p /reflect-run`), single-flighted by a file lock.",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="skip the debt/age gates (still respects the flock and, inside the "
+             "pass, the cross-host reflect-window claim). What /reflect uses.",
+    )
+    p.add_argument(
+        "--if-debt",
+        action="store_true",
+        dest="if_debt",
+        help="reflect only when unconsolidated sessions >= "
+             "BRAIN_REFLECT_DEBT_SESSIONS; exit 0 quietly otherwise.",
+    )
+    return p.parse_args(sys.argv[1:] if argv is None else argv)
+
+
 def main() -> int:
     """Console script `brain-autoreflect`. Acquires the single-flight flock, then
     (unless `--force`) self-guards against a too-recent reflect, resolves the
-    claude binary, and runs `claude -p /reflect`. `--if-debt` additionally
+    claude binary, and runs `claude -p /reflect-run`. `--if-debt` additionally
     requires the reflection debt to clear `REFLECT_DEBT_SESSIONS` — the same
     gate `maybe_trigger` applies before spawning — so a dumb timer can invoke
     this frequently and only pay for a reflect when one is owed.
     `BRAIN_AUTOREFLECT_DRYRUN=1` prints the assembled command and exits without
     spawning claude."""
-    force = "--force" in sys.argv
-    if_debt = "--if-debt" in sys.argv
+    args = _parse_args()
+    force = args.force
+    if_debt = args.if_debt
     REFLECT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     fh = open(REFLECT_LOCK_PATH, "w")  # held for this process's whole lifetime
     try:
@@ -221,7 +240,10 @@ def main() -> int:
         print("[autoreflect] claude binary not found", file=sys.stderr)
         return 1
     cmd = [
-        claude, "-p", "/reflect",
+        # BRAIN_REFLECT_SKILL picks the consolidation skill: /reflect-run works
+        # against a hosted brain over MCP; /reflect-local works on the local
+        # git + SQLite store.
+        claude, "-p", os.environ.get("BRAIN_REFLECT_SKILL", "/reflect-run"),
         "--model", "opus",
         "--permission-mode", "acceptEdits",
         "--allowedTools", *REFLECT_ALLOWED_TOOLS,
@@ -268,7 +290,16 @@ def main() -> int:
 def kill_group(proc: subprocess.Popen) -> None:
     """SIGTERM the child's whole process group, give it a few seconds to drain,
     then SIGKILL any survivors. Guards against the group already being gone
-    (ProcessLookupError) at every step."""
+    (ProcessLookupError) at every step.
+
+    Windows has no process groups in the setsid sense — taskkill /T walks and
+    force-kills the child's whole process tree instead."""
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+        )
+        return
     try:
         pgid = os.getpgid(proc.pid)
     except ProcessLookupError:

@@ -28,7 +28,7 @@ Design invariants (mirrors hook.py):
 
 from __future__ import annotations
 
-import fcntl
+from brain import _flock as fcntl
 import json
 import os
 import shutil

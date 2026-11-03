@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import fcntl
+from brain import _flock as fcntl
 import json
 import os
 import re
@@ -40,6 +40,7 @@ from .config import (
     MAX_LINE_BYTES,
     MEMORIES_DIR,
     SUMMARIES_DIR,
+    normalize_scope,
 )
 
 _VALID_INGEST_SOURCES = ("auto", "episodes", "transcripts")
@@ -60,6 +61,26 @@ def find_transcripts() -> list[Path]:
             files.extend(sorted(proj.glob("*.jsonl")))  # top-level sessions only
             files.extend(sorted(proj.glob("*/subagents/*.jsonl")))  # sidechains
     return files
+
+
+# Profile scope of a transcript, decided by the scan root that produced it: the
+# CLAUDE_CONFIG_DIR split (~/.claude vs ~/.claude-work) IS the personal/work
+# boundary. Any other configured root is unclassifiable -> None (shared), never
+# a guess. Only NEW/changed episodes get stamped; existing rows and the episode
+# files already in git stay scope-less.
+_SCOPE_BY_CONFIG_DIR = {".claude": "personal", ".claude-work": "work"}
+
+
+def transcript_scope(path: Path) -> str | None:
+    """'personal' | 'work' for a transcript under a known scan root, else None.
+    Roots are <config dir>/projects, so the config dir name is the signal."""
+    for root in CLAUDE_PROJECTS_DIRS:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            continue
+        return _SCOPE_BY_CONFIG_DIR.get(root.parent.name)
+    return None
 
 
 # Skill/command plumbing rendered as user prompts, plus interruption stubs —
@@ -179,7 +200,7 @@ def episode_text(ep: dict) -> str:
 # whenever we emit or re-emit; kept in one place so the SELECTs can't drift.
 _EPISODE_ROW_COLS = (
     "stable_id, content_hash, session_id, uuid, ts, cwd, git_branch,"
-    " is_sidechain, text"
+    " is_sidechain, text, scope"
 )
 
 
@@ -207,11 +228,16 @@ def _episode_excluded(cwd) -> bool:
 
 
 def _render_episode_file(
-    stable_id, content_hash, session_id, uuid, ts, cwd, git_branch, is_sidechain, text
+    stable_id, content_hash, session_id, uuid, ts, cwd, git_branch, is_sidechain, text,
+    scope=None,
 ) -> str:
     """The exact bytes of an episode file: YAML frontmatter + a blank line + the
     stored episode_text body + a trailing newline. Deterministic given the row,
-    so re-emitting an unchanged episode is byte-identical."""
+    so re-emitting an unchanged episode is byte-identical. `scope` is emitted
+    ONLY when set, so a shared (scope-less) episode renders exactly the pre-scope
+    bytes and never churns an already-committed file. It is deliberately absent
+    from content_hash — the hash covers the episode's content, and an existing
+    file must keep verifying after the field appears."""
     fm = [
         "---",
         f"stable_id: {_episode_scalar(stable_id)}",
@@ -222,8 +248,11 @@ def _render_episode_file(
         f"cwd: {_episode_scalar(cwd)}",
         f"git_branch: {_episode_scalar(git_branch)}",
         f"is_sidechain: {int(is_sidechain)}",
-        "---",
     ]
+    scope = normalize_scope(scope)  # write the normalized value or nothing
+    if scope:
+        fm.append(f"scope: {_episode_scalar(scope)}")
+    fm.append("---")
     return "\n".join(fm) + "\n\n" + (text or "") + "\n"
 
 
@@ -239,6 +268,8 @@ def emit_episode_file(row) -> Path | None:
     content = _render_episode_file(
         row["stable_id"], row["content_hash"], row["session_id"], row["uuid"],
         row["ts"], row["cwd"], row["git_branch"], row["is_sidechain"], row["text"],
+        # Tolerate a scope-less mapping (both sqlite3.Row and dict expose keys()).
+        row["scope"] if "scope" in row.keys() else None,
     )
     dest = EPISODES_DIR / _episode_shard(row["ts"]) / f"{row['stable_id']}.md"
     # Bytes I/O throughout: text-mode read/write applies universal-newline
@@ -262,19 +293,23 @@ def find_episode_files() -> list[Path]:
     return sorted(EPISODES_DIR.glob("*/*/*.md")) if EPISODES_DIR.is_dir() else []
 
 
-def parse_episode_file(path: Path) -> dict | None:
+def parse_episode_file(path: Path, *, raw: str | None = None) -> dict | None:
     """Inverse of _render_episode_file. Returns the episode fields (including the
     frontmatter `content_hash`, for the caller to re-verify) with the body
     reconstructed byte-exactly, or None when the file is not a well-formed
     episode file (no fences / missing required keys). Does NOT verify the hash —
-    the caller recomputes it from the fields and logs the path on a mismatch."""
-    try:
-        # Bytes read + manual decode: text-mode read_text would apply
-        # universal-newline translation and collapse a body's \r\n / \r, so the
-        # recomputed content_hash would never match the frontmatter.
-        raw = path.read_bytes().decode("utf-8", errors="replace")
-    except OSError:
-        return None
+    the caller recomputes it from the fields and logs the path on a mismatch.
+
+    ``raw`` lets the Supabase loader parse a git blob instead of the working
+    tree. Omit it and the file is read from ``path``."""
+    if raw is None:
+        try:
+            # Bytes read + manual decode: text-mode read_text would apply
+            # universal-newline translation and collapse a body's \r\n / \r, so the
+            # recomputed content_hash would never match the frontmatter.
+            raw = path.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return None
     if not raw.startswith("---\n"):
         return None
     after_open = raw[len("---\n"):]
@@ -320,6 +355,8 @@ def parse_episode_file(path: Path) -> dict | None:
         "cwd": _unscalar("cwd"),
         "git_branch": _unscalar("git_branch"),
         "is_sidechain": is_sidechain,
+        # Absent (every pre-scope file) or unrecognized -> None = shared.
+        "scope": normalize_scope(_unscalar("scope")),
         "text": body_region,
     }
 
@@ -445,15 +482,24 @@ def _git_log_date(path: Path) -> str:
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
-def parse_memory(path: Path) -> dict:
+def parse_memory(path: Path, *, raw: str | None = None, ts_fallback: str = "") -> dict:
     """Parse Claude auto-memory format: YAML-ish frontmatter + markdown body.
 
-    Recency (`ts`) resolves as: frontmatter `date` -> git-log date -> file
-    mtime. `date` is returned raw so the content hash can include it (editing
-    the authored date refreshes recency) while the git/mtime fallbacks stay out
-    of the hash (they'd churn the row on every commit or touch)."""
-    raw = path.read_text(encoding="utf-8", errors="replace")
-    name, description, mtype, date = path.stem, "", None, ""
+    Recency (`ts`) resolves as: frontmatter `date` -> ``ts_fallback`` (the
+    Supabase loader passes the committed git timestamp) -> git-log date ->
+    file mtime. `date` is returned raw so the content hash can include it
+    (editing the authored date refreshes recency) while the git/mtime
+    fallbacks stay out of the hash (they'd churn the row on every commit or
+    touch).
+
+    `metadata.scope` ('personal'|'work'; anything else -> None) is the optional
+    profile stamp; absent means shared, which is every pre-scope memory.
+
+    ``raw`` lets the Supabase loader parse a git blob instead of the working
+    tree. Omit it and the file is read from ``path``."""
+    if raw is None:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    name, description, mtype, date, scope = path.stem, "", None, "", None
     body = raw
     lines = raw.splitlines()
     if lines and lines[0].strip() == "---":
@@ -475,19 +521,25 @@ def parse_memory(path: Path) -> dict:
                         sm = _FM_SUBKEY.match(line)
                         if sm and sm.group(1) == "type":
                             mtype = _unquote(sm.group(2)) or None
+                        elif sm and sm.group(1) == "scope":
+                            scope = normalize_scope(_unquote(sm.group(2)))
                 body = "\n".join(lines[end + 1 :]).strip()
                 break
-    ts = _parse_iso_date(date) or _git_log_date(path)
+    ts = _parse_iso_date(date) or ts_fallback or _git_log_date(path)
     if not ts:
-        ts = datetime.datetime.fromtimestamp(
-            path.stat().st_mtime, tz=datetime.timezone.utc
-        ).isoformat()
+        try:
+            ts = datetime.datetime.fromtimestamp(
+                path.stat().st_mtime, tz=datetime.timezone.utc
+            ).isoformat()
+        except OSError:
+            ts = ""
     return {
         "name": name,
         "description": description,
         "mtype": mtype,
         "path": str(path),
         "date": date,
+        "scope": scope,
         "ts": ts,
         "text": body,
     }
@@ -500,15 +552,17 @@ def find_summary_files() -> list[Path]:
     return sorted(SUMMARIES_DIR.glob("*/*.md")) if SUMMARIES_DIR.is_dir() else []
 
 
-def parse_summary(path: Path) -> dict:
+def parse_summary(path: Path, *, raw: str | None = None, ts_fallback: str = "") -> dict:
     """Parse a reflect-written session digest: frontmatter + markdown body.
 
     Pulls top-level frontmatter keys (session_id, date, project, cwd, host,
     description). `episodes` is deliberately NOT extracted — the summaries table
     has no such column and no hit/get_item shape carries it; reflect reads
     `episodes:` straight from the file for its rewrite-when-doubled rule. `ts`
-    resolves as frontmatter `date` -> file mtime (no git-log fallback)."""
-    raw = path.read_text(encoding="utf-8", errors="replace")
+    resolves as frontmatter `date` -> ``ts_fallback`` -> file mtime (no git-log
+    fallback). ``raw`` parses a git blob instead of the working tree."""
+    if raw is None:
+        raw = path.read_text(encoding="utf-8", errors="replace")
     fields = {
         "session_id": "",
         "date": "",
@@ -530,11 +584,14 @@ def parse_summary(path: Path) -> dict:
                             fields[key] = val
                 body = "\n".join(lines[end + 1 :]).strip()
                 break
-    ts = _parse_iso_date(fields["date"])
+    ts = _parse_iso_date(fields["date"]) or ts_fallback
     if not ts:
-        ts = datetime.datetime.fromtimestamp(
-            path.stat().st_mtime, tz=datetime.timezone.utc
-        ).isoformat()
+        try:
+            ts = datetime.datetime.fromtimestamp(
+                path.stat().st_mtime, tz=datetime.timezone.utc
+            ).isoformat()
+        except OSError:
+            ts = ""
     return {
         "session_id": fields["session_id"],
         "date": fields["date"],
@@ -566,13 +623,14 @@ def index_memory_file(conn, path: Path) -> str:
     mem = parse_memory(path)
     sid = db.memory_stable_id(mem["path"])
     chash = db.memory_content_hash(
-        mem["name"], mem["description"], mem["mtype"], mem["text"], mem["date"]
+        mem["name"], mem["description"], mem["mtype"], mem["text"], mem["date"],
+        mem["scope"],
     )
     with conn:  # one row per file; deletion is prune's job (path-scoped)
         row = conn.execute(
             "INSERT INTO memories(stable_id, content_hash, name, description,"
-            " mtype, path, ts, text)"
-            " VALUES (?,?,?,?,?,?,?,?)"
+            " mtype, path, ts, text, scope)"
+            " VALUES (?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(stable_id) DO UPDATE SET"
             "   content_hash = excluded.content_hash,"
             "   name         = excluded.name,"
@@ -580,7 +638,8 @@ def index_memory_file(conn, path: Path) -> str:
             "   mtype        = excluded.mtype,"
             "   path         = excluded.path,"
             "   ts           = excluded.ts,"
-            "   text         = excluded.text"
+            "   text         = excluded.text,"
+            "   scope        = excluded.scope"
             " WHERE memories.content_hash <> excluded.content_hash"
             " RETURNING id",
             (
@@ -592,6 +651,7 @@ def index_memory_file(conn, path: Path) -> str:
                 mem["path"],
                 mem["ts"],
                 mem["text"],
+                mem["scope"],
             ),
         ).fetchone()
         if row is not None:  # inserted or genuinely updated: drop stale vector
@@ -623,11 +683,13 @@ def _delete_vec_rows(conn, table: str, ids: list[int]) -> None:
 # in place keyed on stable_id; a takeover only moves forward in time and only
 # on a content_hash/source_file change (see specs/stable-ids.md). `vals` order:
 # (stable_id, content_hash, session_id, uuid, ts, cwd, git_branch,
-#  is_sidechain, source_file, text).
+#  is_sidechain, source_file, text, scope). `scope` rides the same guard as
+# every other column: a scope-only difference never rewrites an indexed row, so
+# already-indexed episodes keep the (shared) scope they were ingested with.
 _EPISODE_UPSERT_SQL = (
     "INSERT INTO episodes(stable_id, content_hash, session_id, uuid, ts, cwd,"
-    " git_branch, is_sidechain, source_file, text)"
-    " VALUES (?,?,?,?,?,?,?,?,?,?)"
+    " git_branch, is_sidechain, source_file, text, scope)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
     " ON CONFLICT(stable_id) DO UPDATE SET"
     "   content_hash = excluded.content_hash,"
     "   session_id   = excluded.session_id,"
@@ -637,7 +699,8 @@ _EPISODE_UPSERT_SQL = (
     "   git_branch   = excluded.git_branch,"
     "   is_sidechain = excluded.is_sidechain,"
     "   source_file  = excluded.source_file,"
-    "   text         = excluded.text"
+    "   text         = excluded.text,"
+    "   scope        = excluded.scope"
     " WHERE (episodes.content_hash <> excluded.content_hash"
     "        OR episodes.source_file  <> excluded.source_file)"
     "   AND (excluded.source_file = episodes.source_file"
@@ -682,17 +745,18 @@ def _read_prev_last_ingest() -> str | None:
 
 
 INGEST_LOCK_NAME = ".ingest.lock"
-_LOCK_WAIT_TIMEOUT = 900.0  # blocking (manual-CLI) mode: fail loud after this
+_LOCK_WAIT_TIMEOUT = 900.0  # blocking (--wait) mode: fail loud after this
 
 
 def _acquire_ingest_lock(lock_fh, *, block: bool, log) -> bool:
     """Take the exclusive single-writer ingest lock on `lock_fh`.
 
-    Background callers (server startup ingest, session-refresh) pass block=False:
-    one non-blocking attempt, and False when another writer holds it — the caller
-    then cleanly no-ops. The manual CLI passes block=True: it polls until the
-    lock frees, but bounded by _LOCK_WAIT_TIMEOUT so a wedged holder surfaces as
-    a loud error instead of hanging a terminal forever."""
+    Almost every caller (server startup ingest, session-refresh, and the CLI
+    default) passes block=False: one non-blocking attempt, and False when
+    another writer holds it — the caller then cleanly no-ops. Only `brain-ingest
+    --wait` passes block=True: it polls until the lock frees, but bounded by
+    _LOCK_WAIT_TIMEOUT so a wedged holder surfaces as a loud error instead of
+    hanging a terminal forever."""
     if not block:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -726,9 +790,9 @@ def run_ingest(full: bool = False, log=None, *, block: bool = True) -> dict:
     The lock covers the ENTIRE run — scan, parse, upsert, prune, the embedding
     backfill, and the episodes-in-git emit+commit — so concurrent ingests can
     never embed simultaneously or prune against each other's mid-build state.
-    block=True (the manual CLI) waits for the lock; block=False (server startup
-    ingest, session-refresh) no-ops with a log line when the lock is held,
-    returning {"skipped": True}.
+    block=True (`brain-ingest --wait` only) waits for the lock; block=False
+    (the CLI default, server startup ingest, session-refresh) no-ops with a log
+    line when the lock is held, returning {"skipped": True}.
 
     The episode-file push is deliberately OUTSIDE the lock (mirror remember.py:
     never push under a lock — a slow network must not serialize writers)."""
@@ -861,9 +925,13 @@ def _run_ingest_locked(full: bool, log) -> dict:
     # is a bad checkout (episodes/ wiped or an empty clone), not reality — abort
     # before the prune wipes the index. A fresh machine (empty index) passes.
     if not transcripts and not episode_files:
+        # os.sep goes through the same escaping as the dir: on Windows it is a
+        # backslash, and appending it raw would turn the trailing \% into an
+        # ESCAPEd literal percent — a pattern that matches nothing.
         like = (
-            str(EPISODES_DIR).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            + os.sep + "%"
+            (str(EPISODES_DIR) + os.sep)
+            .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            + "%"
         )
         indexed_episode_files = conn.execute(
             "SELECT count(*) FROM files WHERE path LIKE ? ESCAPE '\\'", (like,)
@@ -905,7 +973,10 @@ def _run_ingest_locked(full: bool, log) -> dict:
                     # deletions (they don't participate in the dedup and would only
                     # eat needless summary re-embeds). LIKE wildcards are escaped so
                     # a '_'/'%' in a project dir name can't over-match a sibling dir.
-                    parent = str(Path(row["path"]).parent) + "/"
+                    # os.sep (escaped with the rest): stored paths carry the
+                    # platform separator, and a hardcoded "/" matches nothing
+                    # against Windows backslash paths.
+                    parent = str(Path(row["path"]).parent) + os.sep
                     like = (
                         parent.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                         + "%"
@@ -942,6 +1013,7 @@ def _run_ingest_locked(full: bool, log) -> dict:
         if not changed:
             continue
         stats["files_changed"] += 1
+        scope = transcript_scope(path)  # from the scan root, not the content
         episodes = parse_transcript(path)
         # Dedupe by stable_id (last wins): the DB's UNIQUE constraint forbids two
         # rows for one (sessionId, uuid); a transcript shouldn't carry a dup, but
@@ -970,6 +1042,7 @@ def _run_ingest_locked(full: bool, log) -> dict:
                 int(ep["is_sidechain"]),
                 str(path),
                 text,
+                scope,
             )
         with conn:  # one transaction per file: diff, delete gone, upsert, mark file
             existing = {
@@ -1036,7 +1109,9 @@ def _run_ingest_locked(full: bool, log) -> dict:
     # one episode keyed by its filename stable_id, so there is no cross-file
     # dedup. content_hash is recomputed from the parsed fields and verified
     # against the frontmatter; a mismatch (tamper/corruption) skips the file. This
-    # mode NEVER emits or commits — the VM is read-only on episodes/.
+    # mode NEVER emits or commits — the VM is read-only on episodes/. Profile
+    # scope is read from the frontmatter (absent = shared) rather than derived
+    # from a scan root — there are no transcripts here to classify.
     if mode == "episode-file":
         for path in episode_files:
             stats["files_seen"] += 1
@@ -1066,7 +1141,7 @@ def _run_ingest_locked(full: bool, log) -> dict:
                 row = _upsert_episode(conn, (
                     parsed["stable_id"], parsed["content_hash"], parsed["session_id"],
                     parsed["uuid"], parsed["ts"], parsed["cwd"], parsed["git_branch"],
-                    parsed["is_sidechain"], str(path), parsed["text"],
+                    parsed["is_sidechain"], str(path), parsed["text"], parsed["scope"],
                 ))
                 if row is not None:
                     if ex is not None:
@@ -1341,6 +1416,13 @@ def main() -> None:
         help="backfill: re-export every indexed episode to episodes/ and "
         "commit+push (episodes-in-git; idempotent). Does not rebuild the index.",
     )
+    ap.add_argument(
+        "--wait",
+        action="store_true",
+        help="queue behind a running ingest (bounded wait) instead of the "
+        "default skip — sessions casually running the CLI must never stack "
+        "multi-GB embedding processes behind one lock",
+    )
     args = ap.parse_args()
 
     def logf(s):
@@ -1349,7 +1431,10 @@ def main() -> None:
     if args.emit_episodes:
         stats = run_emit_episodes(log=logf)
     else:
-        stats = run_ingest(full=args.full, log=logf)
+        stats = run_ingest(full=args.full, log=logf, block=args.wait)
+    if stats.get("skipped"):
+        print("another ingest already holds the lock — skipped (re-run with --wait to queue)")
+        return
     for key, val in stats.items():
         print(f"{key}: {val}")
 

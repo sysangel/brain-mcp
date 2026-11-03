@@ -24,6 +24,7 @@ from . import embed, ranking
 from .config import (
     DB_PATH,
     EMBED_DIM,
+    PROFILE_SCOPE,
     RETURN_TEXT_CAP,
     RRF_K,
     SNIPPET_WIDTH,
@@ -63,7 +64,8 @@ CREATE TABLE IF NOT EXISTS episodes(
     git_branch    TEXT,
     is_sidechain  INTEGER,
     source_file   TEXT,
-    text          TEXT
+    text          TEXT,
+    scope         TEXT                   -- profile scope: 'personal'|'work'; NULL = shared
 );
 CREATE INDEX IF NOT EXISTS episodes_source ON episodes(source_file);
 CREATE TABLE IF NOT EXISTS memories(
@@ -76,7 +78,8 @@ CREATE TABLE IF NOT EXISTS memories(
     mtype         TEXT,
     path          TEXT,
     ts            TEXT,                    -- authored recency: frontmatter `date` -> git-log date -> mtime
-    text          TEXT
+    text          TEXT,
+    scope         TEXT                     -- profile scope: 'personal'|'work'; NULL = shared
 );
 CREATE INDEX IF NOT EXISTS memories_path ON memories(path);
 CREATE TABLE IF NOT EXISTS summaries(
@@ -159,6 +162,28 @@ CREATE VIRTUAL TABLE IF NOT EXISTS summaries_vec USING vec0(
 """
 
 
+# Additive column migrations: nullable columns an EXISTING index can gain in
+# place, because NULL is already their correct value for every pre-existing row
+# (a NULL scope means "shared", which is exactly what a pre-scope row is).
+# Applied idempotently on every connect(); deliberately NOT a SCHEMA_VERSION
+# bump — a forced rebuild would re-derive scope for every episode and rewrite
+# ~1.8k git-tracked episode files, and existing files must stay scope-less.
+# SCHEMA_VERSION remains the mechanism for shape changes that genuinely
+# invalidate the derived index.
+_ADDED_COLUMNS = {
+    "episodes": {"scope": "TEXT"},
+    "memories": {"scope": "TEXT"},
+}
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, cols in _ADDED_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, decl in cols.items():
+            if col not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
 def _load_vec(conn: sqlite3.Connection) -> bool:
     try:
         import sqlite_vec
@@ -200,6 +225,7 @@ def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
         == 0
     )
     conn.executescript(SCHEMA)
+    _add_missing_columns(conn)  # heal a pre-scope DB in place (no rebuild)
     if vec_ok:
         conn.executescript(VEC_SCHEMA)
     if fresh:
@@ -282,13 +308,18 @@ def episode_content_hash(ts, cwd, git_branch, is_sidechain, text) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-def memory_content_hash(name, description, mtype, text, date="") -> str:
+def memory_content_hash(name, description, mtype, text, date="", scope=None) -> str:
     """Change detector for a memory. The frontmatter `date` participates so
     editing the authored date refreshes recency; the git-log/mtime fallbacks
-    do not (they'd churn the row on every commit or touch)."""
+    do not (they'd churn the row on every commit or touch). `metadata.scope`
+    participates too — adding or removing it must re-index the row — but is
+    APPENDED only when set, so every scope-less memory keeps its pre-scope hash
+    and the change costs no re-embedding of the existing corpus."""
     material = "\x00".join(
         (name or "", description or "", mtype or "", text or "", date or "")
     )
+    if scope:
+        material += "\x00" + scope
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
@@ -469,12 +500,26 @@ def _filter_ids(
     since: str | None,
     until: str | None,
 ) -> list[int] | None:
-    """Ids of `kind` rows passing the project/date filters, or None when no
-    filter is active (fast path — identical to unfiltered recall). An empty
-    list means "filter active, nothing matched". `since`/`until` are already
-    resolved `YYYY-MM-DD` bounds (inclusive, day granularity); NULL-`ts` rows
-    are excluded under a date bound and untouched without one."""
-    if project is None and since is None and until is None:
+    """Ids of `kind` rows passing the project/date/profile-scope filters, or
+    None when no filter is active (fast path — identical to unfiltered recall).
+    An empty list means "filter active, nothing matched". `since`/`until` are
+    already resolved `YYYY-MM-DD` bounds (inclusive, day granularity); NULL-`ts`
+    rows are excluded under a date bound and untouched without one.
+
+    The profile-scope filter is implicit (no caller parameter): when BRAIN_SCOPE
+    names a profile, episodes and memories are restricted to shared rows
+    (scope IS NULL) plus that profile's. Summaries are never scope-filtered.
+    With BRAIN_SCOPE unset this returns None exactly as before."""
+    from .profile_ctx import current_profile, profile_overridden
+
+    # HTTP sets a context override (including an explicit neutral None). Stdio
+    # and the sqlite tests patch this module's PROFILE_SCOPE, so the unset
+    # path must read that name rather than config.PROFILE_SCOPE.
+    if kind in ("episode", "memory"):
+        scope = current_profile() if profile_overridden() else PROFILE_SCOPE
+    else:
+        scope = None
+    if project is None and since is None and until is None and scope is None:
         return None
     if kind == "episode":
         table, proj_col = "episodes", "cwd"
@@ -504,6 +549,9 @@ def _filter_ids(
     if until is not None:
         where.append("substr(ts,1,10) <= ?")
         params.append(until)
+    if scope is not None:
+        where.append("(scope IS NULL OR scope = ?)")
+        params.append(scope)
 
     sql = f"SELECT id FROM {table} WHERE " + " AND ".join(where)
     return [r["id"] for r in conn.execute(sql, params).fetchall()]
@@ -519,6 +567,9 @@ def recall(
     Optional filters (project, since, until) restrict both search legs before
     RRF fusion; when any is active the result also carries `filters` (resolved
     values) and `filter_candidates` (rows passing the filter, pre-search).
+    A BRAIN_SCOPE profile additionally restricts episodes and memories to
+    shared + own-profile rows (see _filter_ids); it takes no parameter and is
+    not echoed in `filters` — it is a property of the process, not the query.
     """
     kinds = {
         "all": ["episode", "memory", "summary"],

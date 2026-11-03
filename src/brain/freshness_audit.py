@@ -47,7 +47,7 @@ the lock, writing a file, or spawning anything — a safe read-only smoke check.
 
 from __future__ import annotations
 
-import fcntl
+from brain import _flock as fcntl
 import math
 import os
 import subprocess
@@ -213,6 +213,10 @@ def project_root(project: str) -> Path:
     """The project repo path for <project>: `~/src/<project>`, expressed as
     BRAIN_DIR.parent/<project> so it tracks BRAIN_DIR overrides. (brain itself
     -> BRAIN_DIR; a sibling like project-alpha -> ~/src/project-alpha.)"""
+    # The checkout is not always named `brain` (a cloud agent may use
+    # /workspace), so parent/"brain" is not this repo. This repo is BRAIN_DIR.
+    if project == "brain":
+        return BRAIN_DIR
     return BRAIN_DIR.parent / project
 
 

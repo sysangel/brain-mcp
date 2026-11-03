@@ -23,7 +23,7 @@ the dedup->write window can't race two files into existence.
 
 from __future__ import annotations
 
-import fcntl
+from brain import _flock as fcntl
 import os
 import re
 import socket
@@ -39,10 +39,15 @@ from .config import (
     DUP_SOFT_COSINE,
     FACT_MAX_CHARS,
     MEMORIES_DIR,
+    PROFILE_SCOPE,
+    normalize_scope,
 )
 from .ingest import index_memory_file
 
 _VALID_TYPES = ("user", "feedback", "project", "reference")
+# "shared" is an explicit *refusal* to stamp (it overrides BRAIN_SCOPE); the
+# other two stamp that profile. "" (the default) defers to BRAIN_SCOPE.
+_VALID_SCOPES = ("shared", "personal", "work")
 
 # One lock per process (threadpool) + one lock across processes (flock).
 _module_lock = threading.Lock()
@@ -60,10 +65,18 @@ def slugify(text: str) -> str:
     return s
 
 
+_DESC_MAX = 120
+
+
 def derive_description(fact: str) -> str:
     """First sentence/line of `fact`, markdown-stripped, whitespace-collapsed,
     capped at 120 chars — the one-liner that becomes the frontmatter
-    `description` and leads the dedup embedding text."""
+    `description` and leads the dedup embedding text.
+
+    A sentence that fits is returned whole. A longer one is cut on a word
+    boundary and closed with an ellipsis, so the cap does not look like the
+    sentence ended. ``remember`` stores this string; a row already written
+    keeps the description it was saved with."""
     first = ""
     for line in fact.splitlines():
         if line.strip():
@@ -77,26 +90,69 @@ def derive_description(fact: str) -> str:
     m = re.search(r"[.!?](?:\s|$)", s)                 # first sentence terminator
     if m:
         s = s[: m.start() + 1].strip()
-    if len(s) > 120:
-        s = s[:120].rstrip()
-    return s
+    return _cap_description(s)
 
 
-def format_memory_md(slug: str, description: str, mtype: str, fact: str) -> str:
+def _cap_description(text: str, limit: int = _DESC_MAX) -> str:
+    if len(text) <= limit:
+        return text
+    ellipsis = "…"
+    room = limit - len(ellipsis)
+    cut = text[:room]
+    if room < len(text) and not text[room].isspace():
+        space = cut.rfind(" ")
+        if space > 0:
+            cut = cut[:space]
+    cut = cut.rstrip().rstrip(".,;:!-")
+    if not cut:
+        cut = text[:room].rstrip()
+    return cut + ellipsis
+
+
+def format_memory_md(
+    slug: str, description: str, mtype: str, fact: str, scope: str | None = None
+) -> str:
     """Claude auto-memory format (parseable by ingest.parse_memory). The
     description is double-quoted with inner quotes escaped exactly the way
     ingest._unquote reverses them (\\" -> "); no other escaping, so the parsed
-    value is byte-identical to `description`."""
+    value is byte-identical to `description`. `metadata.scope` is written ONLY
+    when the memory is profile-scoped — a shared memory renders exactly the
+    pre-scope bytes."""
     desc = description.replace('"', '\\"')
+    scope = normalize_scope(scope)  # write the normalized value or nothing
+    scope_line = f"  scope: {scope}\n" if scope else ""
     return (
         "---\n"
         f"name: {slug}\n"
         f'description: "{desc}"\n'
         "metadata:\n"
         f"  type: {mtype}\n"
+        f"{scope_line}"
         "---\n\n"
         f"{fact}\n"
     )
+
+
+def resolve_scope(scope: str, mtype: str) -> str | None:
+    """The `metadata.scope` to stamp on a new memory, or None for shared:
+      'personal' / 'work' — stamp it, always (an explicit call beats the env);
+      'shared'            — never stamp, even under a profile;
+      ''  (the default)   — stamp the active profile, EXCEPT for project
+                            memories: project notes (and the `<project>-state.md`
+                            state notes reflect maintains) describe the repo, not
+                            a profile, so they stay visible to every profile.
+    The active profile is the HTTP request override when one is set
+    (``override_profile``), otherwise this process's ``BRAIN_SCOPE``.
+    Callers validate `scope` first (see remember)."""
+    if scope:
+        return normalize_scope(scope)  # 'shared' normalizes to None
+    if mtype == "project":
+        return None
+    from .profile_ctx import current_profile, profile_overridden
+
+    if profile_overridden():
+        return current_profile()
+    return PROFILE_SCOPE
 
 
 def write_memory_file(memories_dir: Path, base_slug: str, content_for) -> tuple[Path, str]:
@@ -351,11 +407,16 @@ def remember(
     session: str = "",
     project: str = "",
     force: bool = False,
+    scope: str = "",
 ) -> dict:
     """Persist a new memory. See server.remember for the tool docstring."""
     # Phase 1: validate + derive.
     if type not in _VALID_TYPES:
         return {"error": "type must be one of user|feedback|project|reference"}
+    scope_in = (scope or "").strip().lower()
+    if scope_in and scope_in not in _VALID_SCOPES:
+        return {"error": "scope must be one of shared|personal|work"}
+    file_scope = resolve_scope(scope_in, type)
     fact = fact.strip()
     if not fact:
         return {"error": "fact must be a non-empty string"}
@@ -385,7 +446,7 @@ def remember(
             path, slug = write_memory_file(
                 MEMORIES_DIR,
                 base_slug,
-                lambda s: format_memory_md(s, description, type, fact),
+                lambda s: format_memory_md(s, description, type, fact, file_scope),
             )
 
             # Phase 4: index (reuse the candidate vector — no second embed).
@@ -420,6 +481,8 @@ def remember(
         "id": sid,
         "committed": ok,
     }
+    if file_scope:  # only when stamped: a shared write reports exactly as before
+        result["scope"] = file_scope
     if not ok:
         result["commit_error"] = err
     if vec_pending:

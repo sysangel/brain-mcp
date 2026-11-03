@@ -9,7 +9,7 @@ code, unlike a long-lived `brain-server` pinned at spawn time.
 Reads ONE JSON object from stdin (no flags), e.g.:
 
     {"fact": "...", "type": "project", "name": "", "session": "",
-     "project": "", "force": false}
+     "project": "", "force": false, "scope": ""}
 
 Only `fact` is required; every other field defaults exactly as the MCP tool.
 Prints the result dict as JSON on stdout. Exit 0 on a successful write AND on a
@@ -56,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
             session=payload.get("session") or "",
             project=payload.get("project") or "",
             force=bool(payload.get("force", False)),
+            scope=payload.get("scope") or "",
         )
     finally:
         conn.close()

@@ -18,7 +18,7 @@ Invariants:
   daemon) are ff-only and never push, so a daemon thread can never rewrite local
   unpushed SHAs or move `main` under a concurrent interactive git session.
   Caveat: "foreground" here means the pull path, NOT necessarily human-attended.
-  A headless auto-reflect (autoreflect.py -> `claude -p /reflect` -> reflect
+  A headless auto-reflect (autoreflect.py -> `claude -p /reflect-run` -> reflect
   step 1's `brain-sync pull`) runs this same rebasing path unattended. That is
   intentional (the reflect flock single-flights it), but it means an unattended
   rebase of local memory commits can still occur along the auto-reflect path.
@@ -29,7 +29,7 @@ Invariants:
 from __future__ import annotations
 
 import datetime
-import fcntl
+from brain import _flock as fcntl
 import os
 import subprocess
 import sys

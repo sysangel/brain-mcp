@@ -5,12 +5,16 @@ Env overrides:
   BRAIN_CLAUDE_PROJECTS  — Claude Code projects dir(s), colon-separated
                            (default: ~/.claude/projects and ~/.claude-work/projects,
                            each included only if it exists)
+  BRAIN_SCOPE            — profile scope of THIS process: personal | work
+                           (unset/anything else = neutral: unfiltered reads,
+                           unstamped writes — exactly the pre-scope behavior)
   BRAIN_RRF_K            — RRF damping constant (default: 60)
   BRAIN_KIND_WEIGHT_{MEMORY,SUMMARY,EPISODE}  — per-kind rank multipliers
   BRAIN_HALF_LIFE_{MEMORY,SUMMARY,EPISODE}    — per-kind recency half-life (days)
   BRAIN_RECENCY_FLOOR   — minimum recency factor (default: 0.35)
   BRAIN_REFLECT_DEBT_SESSIONS — unconsolidated sessions that trigger reflect (default: 1)
   BRAIN_REFLECT_MIN_AGE_H — hours since last reflect before debt can trigger (default: 20)
+  BRAIN_REFLECT_STALL_H — hours before SessionStart reports nightly reflect stalled (default: 36)
   BRAIN_STATE_STALE_DAYS — archive a quiet project's state note after this (default: 30)
   BRAIN_SESSION_MAX_CHARS — SessionStart injection block cap (default: 4000)
   BRAIN_SESSION_EPISODES_BANNER — episodes-since count that raises the STALE banner (default: 10)
@@ -54,6 +58,27 @@ EPISODES_DIR = BRAIN_DIR / "episodes"
 # LOUDLY at ingest start (never a silent fallback — that would reintroduce the
 # bug invisibly). Validated in ingest.run_ingest, not here.
 INGEST_SOURCE = (os.environ.get("BRAIN_INGEST_SOURCE") or "").strip().lower() or "auto"
+
+# Profile scope: which profile (personal | work) THIS process belongs to.
+# Unset (or any other value) is NEUTRAL and is exactly today's behavior: reads
+# are unfiltered and writes are unstamped. When set, reads return only shared
+# rows (scope IS NULL) plus rows of that profile, and non-project memory writes
+# default-stamp it. `metadata.scope` on a memory/episode file is the persisted
+# side of the same value; absent = shared, visible to every profile. Existing
+# files are NEVER migrated or backfilled — scope-less means shared, forever.
+PROFILE_SCOPES = ("personal", "work")
+
+
+def normalize_scope(value: str | None) -> str | None:
+    """Normalize a profile-scope value: 'personal'/'work' (case- and
+    whitespace-insensitive) pass through; everything else — including "",
+    None, and 'shared' — is None, i.e. shared/neutral. Single definition so the
+    env knob, the frontmatter parser, and the remember tool can't drift."""
+    v = (value or "").strip().lower()
+    return v if v in PROFILE_SCOPES else None
+
+
+PROFILE_SCOPE = normalize_scope(os.environ.get("BRAIN_SCOPE"))  # None = neutral
 
 # Privacy denylist for session digests: comma-separated cwd/project substrings.
 # Reflect drops any digest candidate whose cwd/project contains one of these,
@@ -131,10 +156,27 @@ EMBED_BACKFILL_CHUNK = int(os.environ.get("BRAIN_EMBED_BACKFILL_CHUNK") or "128"
 # onnxruntime intra-op thread cap for the embedder so a single ingest doesn't
 # oversubscribe every core (matters on small-RAM/CPU boxes during a rebuild).
 EMBED_THREADS = int(os.environ.get("BRAIN_EMBED_THREADS") or "4")
-# Inference batch size fed to fastembed/onnxruntime. The backfill chunk only
-# bounds DB paging; THIS bounds the activation arena, which at batch 32 peaks
-# well over 1GB and OOM-kills a 2GB box (the model weights alone are ~550MB).
+# Upper cap on documents per inference call. This alone does NOT bound memory:
+# transformer activation peak is O(batch * seq_len^2), and seq_len is whatever
+# the longest doc in the batch tokenizes to (the tokenizer pads a batch to its
+# longest member). A fixed batch of 32 at ~1000 tokens costs ~6GB of transient
+# activations — that is what blew a full rebuild up to 14GB. EMBED_TOKEN_BUDGET
+# below is the real bound; this cap only keeps batches of tiny docs sane.
 EMBED_BATCH = int(os.environ.get("BRAIN_EMBED_BATCH") or "32")
+# THE memory bound for embedding: max allowed `len(batch) * max_tokens^2`.
+# embed.py sorts by token length and packs batches under this ceiling, so a
+# batch of long docs is automatically small and a batch of short docs is large.
+# Measured on onnxruntime 1.27 / nomic-embed-text-v1.5: transient activation
+# peak is ~370MB per 1e6 of this product, on top of ~800MB of resident model.
+# 1e6 => ~1.2GB peak. Throughput is flat in batch size on CPU (~0.38 s/doc at
+# every batch size measured), so shrinking batches costs no wall time.
+EMBED_TOKEN_BUDGET = int(os.environ.get("BRAIN_EMBED_TOKEN_BUDGET") or "1000000")
+# onnxruntime's CPU arena never returns freed blocks to the OS, so a process
+# that embeds once keeps its high-water mark forever — an idle brain-server sat
+# at 2.6GB. Disabling it costs no measurable throughput here and lets the
+# allocator hand pages back between batches. Set BRAIN_EMBED_CPU_ARENA=1 to
+# restore onnxruntime's default.
+EMBED_CPU_ARENA = (os.environ.get("BRAIN_EMBED_CPU_ARENA") or "0") == "1"
 
 # Ingest / storage
 EPISODE_TEXT_CAP = 20_000  # chars stored per episode
@@ -255,11 +297,25 @@ SESSION_REFRESH_LOCK_PATH = CACHE_DIR / "session-refresh.lock"  # non-blocking f
 # override falls back to the default rather than crashing the daemon thread.
 REFLECT_DEBT_SESSIONS = int(_env_float("BRAIN_REFLECT_DEBT_SESSIONS", 1, lo=1))  # sessions to trigger
 REFLECT_MIN_AGE_H = _env_float("BRAIN_REFLECT_MIN_AGE_H", 20.0, lo=0)  # hours since last reflect
+# SessionStart "nightly reflect looks stalled" line. Higher than MIN_AGE so a
+# healthy nightly pass does not warn for the rest of the day.
+REFLECT_STALL_H = _env_float("BRAIN_REFLECT_STALL_H", 36.0, lo=0)
 STATE_STALE_DAYS = int(_env_float("BRAIN_STATE_STALE_DAYS", 30, lo=1))  # archive horizon for quiet notes
 
-# cache/-local (per-machine, never synced): reflection debt is inherently local.
-# LAST_REFLECT_PATH is the single source of truth for the marker the skill and
-# the Python side share (the skill previously hardcoded the path).
-LAST_REFLECT_PATH = CACHE_DIR / "last-reflect"  # single-line ISO-8601 UTC-Z; written by reflect
+# cache/-local (per-machine, never synced). LAST_REFLECT_PATH is the LEGACY
+# per-host reflect stamp — superseded by the committed REFLECT_WATERMARK_PATH
+# below, but still mirrored on completion and read as a migration fallback
+# (see reflect_window.read_watermark).
+LAST_REFLECT_PATH = CACHE_DIR / "last-reflect"  # single-line ISO-8601 UTC-Z; legacy mirror
 REFLECT_LOCK_PATH = CACHE_DIR / ".reflect.lock"  # non-blocking flock: one reflect at a time
 AUTOREFLECT_LOG = CACHE_DIR / "autoreflect.log"  # detached-spawn stdout/stderr
+
+# state/-committed (shared via git, unlike cache/): the cross-host reflect
+# window. The watermark is the review-window floor ANY host's reflect advances;
+# the claim is a soft lease keeping two hosts from reviewing the same window
+# concurrently (see reflect_window.py). The TTL must exceed the reflect child
+# timeout (1800s) so a live pass can never look expired.
+STATE_DIR = BRAIN_DIR / "state"
+REFLECT_WATERMARK_PATH = STATE_DIR / "last-reflect"  # ISO-8601 UTC-Z; advanced by `complete`
+REFLECT_CLAIM_PATH = STATE_DIR / "reflect-claim"  # "<host> <started-ISO>" while a pass runs
+REFLECT_CLAIM_TTL_S = _env_float("BRAIN_REFLECT_CLAIM_TTL_S", 2700.0, lo=0)
