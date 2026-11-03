@@ -24,6 +24,23 @@ def _make_fake_claude(tmp_path, sleep_s=30, sentinel=None, sentinel_delay=0):
     If `sentinel` is given, it first backgrounds a grandchild that, after
     `sentinel_delay`s, writes the sentinel file — the marker we use to detect a
     grandchild that outlived the kill."""
+    if sys.platform == "win32":
+        # Windows can't exec shebang scripts; use .cmd files (ping -n N waits
+        # N-1 seconds). The grandchild is its own .cmd spawned with `start /b`
+        # so it lands in the fake claude's process tree — taskkill /T's reach.
+        script = tmp_path / "claude.cmd"
+        lines = ["@echo off"]
+        if sentinel is not None:
+            grandchild = tmp_path / "grandchild.cmd"
+            grandchild.write_text(
+                "@echo off\r\n"
+                f"ping -n {int(sentinel_delay) + 1} 127.0.0.1 >nul\r\n"
+                f'type nul > "{sentinel}"\r\n'
+            )
+            lines.append(f'start /b "" "{grandchild}"')
+        lines.append(f"ping -n {int(sleep_s) + 1} 127.0.0.1 >nul")
+        script.write_text("\r\n".join(lines) + "\r\n")
+        return script
     script = tmp_path / "claude"
     lines = ["#!/bin/sh"]
     if sentinel is not None:
@@ -87,7 +104,7 @@ def test_timeout_kills_grandchildren(tmp_path, monkeypatch):
 
 def _lock_is_held(path):
     """True iff another holder still owns the exclusive flock on `path`."""
-    import fcntl
+    from brain import _flock as fcntl
 
     with open(path, "w") as fh:
         try:

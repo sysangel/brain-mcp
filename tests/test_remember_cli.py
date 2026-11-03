@@ -72,9 +72,10 @@ def test_happy_path_threads_payload_and_defaults(monkeypatch, capsys):
     # the payload→kwargs threading + defaulting without any real write.
     captured: dict = {}
 
-    def fake_impl(conn, fact, *, type, name, session, project, force):
+    def fake_impl(conn, fact, *, type, name, session, project, force, scope):
         captured.update(
-            fact=fact, type=type, name=name, session=session, project=project, force=force
+            fact=fact, type=type, name=name, session=session, project=project,
+            force=force, scope=scope,
         )
         return {"status": "created", "name": "n", "id": "mem_x", "committed": True}
 
@@ -96,4 +97,5 @@ def test_happy_path_threads_payload_and_defaults(monkeypatch, capsys):
         "session": "",
         "project": "",
         "force": True,
+        "scope": "",  # unset -> remember() defers to the BRAIN_SCOPE profile
     }

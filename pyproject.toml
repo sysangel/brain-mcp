@@ -1,27 +1,44 @@
 [project]
 name = "brain"
 version = "0.1.0"
-description = "Personal memory MCP server: markdown+git as source of truth, SQLite hybrid-search index as rebuildable cache"
+description = "Personal memory MCP server: hybrid recall over a local SQLite index or a Postgres (Supabase) store, served over stdio or HTTP with OAuth."
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=2,<3",
     "fastembed>=0.8.0",
     "sqlite-vec>=0.1.9",
+    "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
+    "pgvector>=0.3",
+    "uvicorn>=0.32",
 ]
 
 [project.scripts]
 brain-ingest = "brain.ingest:main"
 brain-server = "brain.server:main"
+brain-server-http = "brain.http_server:main"
 brain-server-readonly = "brain.server_readonly:main"
 brain-hook = "brain.hook:main"
 brain-sync = "brain.sync:main"
 brain-autoreflect = "brain.autoreflect:main"
+brain-reflect-window = "brain.reflect_window:main"
 brain-freshness-audit = "brain.freshness_audit:main"
 brain-usage-report = "brain.usage_report:main"
 brain-recall = "brain.cli:main"
 brain-remember = "brain.remember_cli:main"
+brain-pg-migrate = "brain.pg_admin:migrate_main"
+brain-pg-load = "brain.pg_loader:main"
+brain-pg-reembed = "brain.pg_reembed:main"
+brain-pg-reflect = "brain.pg_reflect:main"
+brain-git-export = "brain.git_export:main"
+brain-backup = "brain.backup:main"
+brain-nightly = "brain.nightly:main"
 brain-session-start = "brain.session_start:main"
 brain-session-refresh = "brain.session_start:refresh_main"
+brain-push = "brain.push:main"
+brain-device-token = "brain.device_cli:main"
+brain-remote-recall-hook = "brain.remote_hooks:recall_main"
+brain-remote-session-start = "brain.remote_hooks:session_start_main"
 
 [dependency-groups]
 dev = ["pytest", "ruff"]
@@ -36,5 +53,10 @@ packages = ["src/brain"]
 # Ruff runs the default rule set (E4/E7/E9/F). One pre-existing violation is
 # scoped out per-file so the check passes honestly without touching unrelated
 # code; every other file — including all tests — stays fully linted.
+[tool.pytest.ini_options]
+markers = [
+    "postgres: needs DATABASE_URL via the pg or migrated_url fixture; applied automatically at collection",
+]
+
 [tool.ruff.lint.per-file-ignores]
 "src/brain/usage_report.py" = ["E731"]        # deliberate local table-row lambda

@@ -4,7 +4,8 @@ Description=brain: pull + ingest episode files, then debt-triggered reflect
 [Service]
 Type=oneshot
 WorkingDirectory=%h/src/brain-mcp
-# CLAUDE_CODE_OAUTH_TOKEN for the headless `claude -p /reflect` child
+# CLAUDE_CODE_OAUTH_TOKEN for the headless `claude -p /reflect-run` child
+# (the reflect-run skill must resolve on this host, e.g. ~/.claude/skills)
 EnvironmentFile=%h/.config/claude.env
 # The VM ingests from episodes/ (git transport) — never from its own local
 # claude transcripts, which exist here because reflect itself runs claude.

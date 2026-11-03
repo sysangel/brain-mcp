@@ -25,7 +25,68 @@ jobs:
       # unavailable on the runner; embedding-dependent tests already skip when
       # sqlite-vec is missing (db.has_vec is False), so the suite passes on an
       # FTS-only index. BRAIN_SYNC=0 keeps sync fully offline.
+      #
+      # Database tests are marked postgres (any test using the pg or
+      # migrated_url fixture) and run in supabase-sql. Deselect them here.
+      # BRAIN_FORBID_DB_SKIP fails the job if one still runs and skips for
+      # lack of DATABASE_URL, instead of hiding a new file from CI.
       - name: Pytest
         env:
           BRAIN_SYNC: "0"
-        run: uv run pytest -q
+          BRAIN_BACKEND: sqlite
+          BRAIN_FORBID_DB_SKIP: "1"
+        run: uv run pytest -q -m "not postgres"
+
+  # Supabase-compatible Postgres (pgvector). The job boots the same extension
+  # Supabase runs; it does not call Supabase itself. Schema `brain`, RLS, and
+  # recall_candidates are what this covers.
+  supabase-sql:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: brain
+          POSTGRES_USER: brain
+          POSTGRES_DB: brain
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U brain -d brain"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync
+
+      # Select by the postgres mark, not a file list, so a new test that
+      # uses the pg fixture runs here instead of skipping in the sqlite job.
+      # The backup restore test needs a client at least as new as the server.
+      # Supabase is Postgres 17. Ubuntu's default client is older and pg_dump
+      # refuses a newer server, so the client comes from PGDG.
+      - name: Install PostgreSQL 17 client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Postgres tests
+        env:
+          BRAIN_SYNC: "0"
+          DATABASE_URL: postgresql://brain:brain@localhost:5432/brain
+          BRAIN_EMBED_PROVIDER: openai
+          BRAIN_FORBID_DB_SKIP: "1"
+        run: uv run pytest -q -m postgres

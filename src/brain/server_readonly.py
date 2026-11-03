@@ -20,6 +20,7 @@ import threading
 
 from fastmcp import FastMCP
 
+from . import winstdin
 from .server import _ensure_fresh_index, get_episode, recall
 
 mcp = FastMCP("brain")
@@ -31,6 +32,7 @@ mcp.tool(get_episode)
 
 
 def main() -> None:
+    winstdin.install()  # before mcp.run() parks a CRT read on stdin (see winstdin)
     threading.Thread(target=_ensure_fresh_index, name="brain-ingest", daemon=True).start()
     mcp.run()  # stdio transport — answers initialize immediately
 

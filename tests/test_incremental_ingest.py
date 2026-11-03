@@ -35,7 +35,7 @@ def _user_line(session, uuid, ts, text):
 
 def _write_transcript(path, episodes):
     """episodes: list of (session, uuid, ts, user_text)."""
-    path.write_text("\n".join(_user_line(*e) for e in episodes) + "\n")
+    path.write_text("\n".join(_user_line(*e) for e in episodes) + "\n", newline="\n")
 
 
 def _wire(monkeypatch, tmp_path, transcripts, *, embedder=None):

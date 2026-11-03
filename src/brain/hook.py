@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -32,6 +33,7 @@ from .config import (
     HOOK_MIN_MATCH,
     HOOK_SEEN_DIR,
     HOOK_SEEN_TTL_DAYS,
+    PROFILE_SCOPE,
 )
 
 # ~35 common 3+-letter words (deliberately generous — extra stopwords only make
@@ -70,36 +72,36 @@ def _content_tokens(text: str) -> list[str]:
     return out
 
 
-def _seen_path(session_id: str) -> Path:
+def _seen_path(session_id: str, base: Path | None = None) -> Path:
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:128] or "nosession"
-    return HOOK_SEEN_DIR / f"{safe}.txt"
+    return (base or HOOK_SEEN_DIR) / f"{safe}.txt"
 
 
-def _read_seen(session_id: str) -> set[str]:
+def _read_seen(session_id: str, base: Path | None = None) -> set[str]:
     try:
-        text = _seen_path(session_id).read_text(encoding="utf-8")
+        text = _seen_path(session_id, base).read_text(encoding="utf-8")
     except OSError:
         return set()
     return {line for line in text.splitlines() if line}
 
 
-def _append_seen(session_id: str, keys: list[str]) -> None:
+def _append_seen(session_id: str, keys: list[str], base: Path | None = None) -> None:
     if not keys:
         return
     try:
-        HOOK_SEEN_DIR.mkdir(parents=True, exist_ok=True)
-        with _seen_path(session_id).open("a", encoding="utf-8") as fh:
+        (base or HOOK_SEEN_DIR).mkdir(parents=True, exist_ok=True)
+        with _seen_path(session_id, base).open("a", encoding="utf-8") as fh:
             for key in keys:
                 fh.write(key + "\n")
     except OSError as exc:
         _debug(f"seen-write failed: {exc!r}")
 
 
-def _prune_seen(now: float) -> None:
+def _prune_seen(now: float, base: Path | None = None) -> None:
     """Opportunistically unlink seen-files older than the TTL (one iterdir)."""
     cutoff = now - HOOK_SEEN_TTL_DAYS * 86400
     try:
-        entries = list(HOOK_SEEN_DIR.iterdir())
+        entries = list((base or HOOK_SEEN_DIR).iterdir())
     except OSError:
         return
     for path in entries:
@@ -114,12 +116,33 @@ def _query_memories(conn, expr: str) -> list[dict]:
     """Top HOOK_FTS_LIMIT memory rows by BM25 rank for the MATCH expression.
     Two steps: FTS gives ranked rowids, the base table gives the columns the
     gate/format need (name/description/text plus path for the dedup key and ts
-    for the date). Rank order is preserved by iterating the FTS rowid list."""
-    fts_rows = conn.execute(
+    for the date). Rank order is preserved by iterating the FTS rowid list.
+
+    Under a BRAIN_SCOPE profile the FTS leg is pre-filtered to shared +
+    own-profile memories (same rule as db._filter_ids), so the profile boundary
+    holds for the ambient injection too — filter-then-rank, so the cap counts
+    only visible rows. The DB is opened read-only here, so it may predate the
+    additive `scope` column (db._add_missing_columns runs on a writable
+    connect); such a DB has no scoped rows at all, which makes the unfiltered
+    query exactly equivalent — fall back to it rather than going silent."""
+    base_sql = (
         "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ? "
-        "ORDER BY rank LIMIT ?",
-        (expr, HOOK_FTS_LIMIT),
-    ).fetchall()
+        "ORDER BY rank LIMIT ?"
+    )
+    scoped_sql = (
+        "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ? "
+        "AND rowid IN (SELECT id FROM memories WHERE scope IS NULL OR scope = ?) "
+        "ORDER BY rank LIMIT ?"
+    )
+    if PROFILE_SCOPE:
+        try:
+            fts_rows = conn.execute(
+                scoped_sql, (expr, PROFILE_SCOPE, HOOK_FTS_LIMIT)
+            ).fetchall()
+        except sqlite3.OperationalError:  # pre-migration DB: no scope column yet
+            fts_rows = conn.execute(base_sql, (expr, HOOK_FTS_LIMIT)).fetchall()
+    else:
+        fts_rows = conn.execute(base_sql, (expr, HOOK_FTS_LIMIT)).fetchall()
     ids = [r["rowid"] for r in fts_rows]
     if not ids:
         return []
