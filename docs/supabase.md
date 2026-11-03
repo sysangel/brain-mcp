@@ -293,9 +293,9 @@ and writes the token straight to `~/.config/brain/device-token`, so it never
 lands in a chat transcript:
 
 ```sh
-uv run --directory ~/src/brain brain-device-token create --device work-laptop
-uv run --directory ~/src/brain brain-device-token list
-uv run --directory ~/src/brain brain-device-token revoke 3
+uv run --directory ~/src/brain-mcp-mcp brain-device-token create --device work-laptop
+uv run --directory ~/src/brain-mcp-mcp brain-device-token list
+uv run --directory ~/src/brain-mcp-mcp brain-device-token revoke 3
 ```
 
 The same operations exist as MCP tools on `/mcp` (`device_token_create`,
@@ -313,7 +313,7 @@ which puts `brain-push` and the hook commands on PATH.
 ### Claude Code hooks
 
 Example `~/.claude/settings.json` hooks block. Adjust the checkout path; on
-macOS or Linux use `~/src/brain`. `Stop` records after every turn and
+macOS or Linux use `~/src/brain-mcp`. `Stop` records after every turn and
 `SessionEnd` catches the last one. Both detach and return at once.
 
 ```json
@@ -321,19 +321,19 @@ macOS or Linux use `~/src/brain`. `Stop` records after every turn and
   "hooks": {
     "SessionStart": [
       { "hooks": [ { "type": "command", "timeout": 10,
-        "command": "uv run --no-sync --directory C:/Users/you/src/brain brain-remote-session-start" } ] }
+        "command": "uv run --no-sync --directory C:/Users/you/src/brain-mcp-mcp brain-remote-session-start" } ] }
     ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "timeout": 5,
-        "command": "uv run --no-sync --directory C:/Users/you/src/brain brain-remote-recall-hook" } ] }
+        "command": "uv run --no-sync --directory C:/Users/you/src/brain-mcp-mcp brain-remote-recall-hook" } ] }
     ],
     "Stop": [
       { "hooks": [ { "type": "command", "timeout": 10,
-        "command": "uv run --no-sync --directory C:/Users/you/src/brain brain-push --hook" } ] }
+        "command": "uv run --no-sync --directory C:/Users/you/src/brain-mcp-mcp brain-push --hook" } ] }
     ],
     "SessionEnd": [
       { "hooks": [ { "type": "command", "timeout": 10,
-        "command": "uv run --no-sync --directory C:/Users/you/src/brain brain-push --hook" } ] }
+        "command": "uv run --no-sync --directory C:/Users/you/src/brain-mcp-mcp brain-push --hook" } ] }
     ]
   }
 }
@@ -372,15 +372,15 @@ schtasks /Create /TN "brain-push" /SC MINUTE /MO 30 /F /TR "powershell -NoProfil
 cron:
 
 ```sh
-*/30 * * * * cd ~/src/brain && uv run --no-sync brain-push >/dev/null 2>&1
+*/30 * * * * cd ~/src/brain-mcp-mcp && uv run --no-sync brain-push >/dev/null 2>&1
 ```
 
 Once per device, after the hooks are in, record everything since the
 snapshot import (or since the first session, for a fresh install):
 
 ```sh
-uv run --directory ~/src/brain brain-push --backfill --dry-run   # counts only
-uv run --directory ~/src/brain brain-push --backfill
+uv run --directory ~/src/brain-mcp-mcp brain-push --backfill --dry-run   # counts only
+uv run --directory ~/src/brain-mcp-mcp brain-push --backfill
 ```
 
 `--since` moves the floor (`--since 2026-09-01`, or `--since all`).

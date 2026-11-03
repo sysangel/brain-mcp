@@ -171,7 +171,7 @@ gcloud run jobs deploy brain-nightly \
   --source=. \
   --command=brain-nightly \
   --set-secrets=DATABASE_URL=brain-database-url-ops:latest,GITHUB_TOKEN=brain-github-export-token:latest \
-  --set-env-vars=BRAIN_BACKUP_BUCKET=PROJECT_ID-brain-backups,BRAIN_BACKUP_TZ=America/New_York,BRAIN_GIT_REPO=OWNER/brain,BRAIN_BACKEND=postgres \
+  --set-env-vars=BRAIN_BACKUP_BUCKET=PROJECT_ID-brain-backups,BRAIN_BACKUP_TZ=UTC,BRAIN_GIT_REPO=OWNER/brain,BRAIN_BACKEND=postgres \
   --service-account=PROJECT_NUMBER-compute@developer.gserviceaccount.com \
   --max-retries=1 \
   --task-timeout=600 \
@@ -197,7 +197,7 @@ gcloud scheduler jobs create http brain-nightly \
   --project=PROJECT_ID \
   --location=REGION \
   --schedule="0 3 * * *" \
-  --time-zone="America/New_York" \
+  --time-zone="UTC" \
   --uri="https://run.googleapis.com/v2/projects/PROJECT_ID/locations/REGION/jobs/brain-nightly:run" \
   --http-method=POST \
   --oauth-service-account-email=PROJECT_NUMBER-compute@developer.gserviceaccount.com \
